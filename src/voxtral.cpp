@@ -229,8 +229,34 @@ struct voxtral_context {
     ggml_cgraph  * dec_prefill_cached_gf   = nullptr;
     std::vector<uint8_t> dec_prefill_cached_meta;
     int32_t dec_prefill_cached_tokens = -1;
+
+    struct dec_step_cache_entry {
+        int32_t position = -1;
+        int32_t audio_pos = -1;
+        int32_t kv_used = -1;
+        ggml_context * gctx = nullptr;
+        ggml_cgraph  * gf = nullptr;
+        std::vector<uint8_t> meta;
+    };
+    std::vector<dec_step_cache_entry> dec_step_cache;
+    int32_t dec_step_cache_capacity = 96;
     bool backend_failed = false;
 };
+
+static void clear_decoder_step_cache(voxtral_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    for (auto & e : ctx->dec_step_cache) {
+        if (e.gctx) {
+            ggml_free(e.gctx);
+            e.gctx = nullptr;
+            e.gf = nullptr;
+        }
+        e.meta.clear();
+    }
+    ctx->dec_step_cache.clear();
+}
 
 static bool sched_alloc_safe(voxtral_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * gf, const char * stage) {
     try {
@@ -1210,6 +1236,7 @@ static int32_t pick_default_threads() {
 
 void voxtral_free(voxtral_context * ctx) {
     if (!ctx) return;
+    clear_decoder_step_cache(ctx);
     if (ctx->encoder_cached_gctx)     ggml_free(ctx->encoder_cached_gctx);
     if (ctx->dec_prefill_cached_gctx) ggml_free(ctx->dec_prefill_cached_gctx);
     if (ctx->sched_encoder)  ggml_backend_sched_free(ctx->sched_encoder);
@@ -1391,6 +1418,7 @@ static bool alloc_decoder_memory(voxtral_context * ctx, int32_t dec_seq) {
         ctx->dec_prefill_cached_tokens = -1;
         ctx->dec_prefill_cached_meta.clear();
     }
+    clear_decoder_step_cache(ctx);
     return true;
 }
 
@@ -2174,13 +2202,21 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
             const size_t src_offset = (size_t) skip * elem_bytes;
             const size_t dst_offset = (size_t) enc_write_offset * elem_bytes;
             const size_t copy_bytes = (size_t) stride * elem_bytes;
-
-            static thread_local std::vector<uint8_t> tmp;
-            if (tmp.size() < copy_bytes) {
-                tmp.resize(copy_bytes);
+            if (ctx->gpu_type == voxtral_gpu_backend::none &&
+                ctx->encoder_chunk_output->data != nullptr &&
+                ctx->encoder_output->data != nullptr) {
+                // CPU fast-path: avoid backend get/set roundtrip.
+                memcpy((uint8_t *) ctx->encoder_output->data + dst_offset,
+                       (const uint8_t *) ctx->encoder_chunk_output->data + src_offset,
+                       copy_bytes);
+            } else {
+                static thread_local std::vector<uint8_t> tmp;
+                if (tmp.size() < copy_bytes) {
+                    tmp.resize(copy_bytes);
+                }
+                ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), src_offset, copy_bytes);
+                ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
             }
-            ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), src_offset, copy_bytes);
-            ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
         }
 
         enc_write_offset += stride;
@@ -2390,26 +2426,57 @@ static bool run_decoder_step(
         ctx->kv_used = ctx->kv_window - 1;
     }
 
-    // Use thread-local buffer to avoid per-step heap allocation
-    static thread_local std::vector<uint8_t> step_meta_buf;
-    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
-                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    if (step_meta_buf.size() < meta_size) {
-        step_meta_buf.resize(meta_size);
+    const int32_t kv_used = ctx->kv_used;
+    voxtral_context::dec_step_cache_entry * cache_hit = nullptr;
+    for (auto & e : ctx->dec_step_cache) {
+        if (e.position == position && e.audio_pos == audio_pos && e.kv_used == kv_used) {
+            cache_hit = &e;
+            break;
+        }
     }
 
-    ggml_init_params p = {
-        /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ step_meta_buf.data(),
-        /*.no_alloc  =*/ true,
-    };
-    ggml_context * gctx = ggml_init(p);
+    if (!cache_hit) {
+        if ((int32_t) ctx->dec_step_cache.size() >= ctx->dec_step_cache_capacity && !ctx->dec_step_cache.empty()) {
+            auto & old = ctx->dec_step_cache.front();
+            if (old.gctx) {
+                ggml_free(old.gctx);
+            }
+            ctx->dec_step_cache.erase(ctx->dec_step_cache.begin());
+        }
 
-    ggml_cgraph * gf = build_decoder_step_graph(ctx, gctx, position, audio_pos);
+        ctx->dec_step_cache.push_back({});
+        cache_hit = &ctx->dec_step_cache.back();
+        cache_hit->position = position;
+        cache_hit->audio_pos = audio_pos;
+        cache_hit->kv_used = kv_used;
+
+        const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
+                                 ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
+        if (cache_hit->meta.size() < meta_size) {
+            cache_hit->meta.resize(meta_size);
+        }
+
+        ggml_init_params p = {
+            /*.mem_size  =*/ meta_size,
+            /*.mem_buffer=*/ cache_hit->meta.data(),
+            /*.no_alloc  =*/ true,
+        };
+        cache_hit->gctx = ggml_init(p);
+        if (!cache_hit->gctx) {
+            LOG_ERR(ctx, "decoder step: failed to init cache graph context");
+            return false;
+        }
+        cache_hit->gf = build_decoder_step_graph(ctx, cache_hit->gctx, position, audio_pos);
+    }
+
+    ggml_cgraph * gf = cache_hit->gf;
+    if (!gf) {
+        LOG_ERR(ctx, "decoder step: cached graph is null");
+        return false;
+    }
 
     ggml_backend_sched_reset(ctx->sched_dec_step);
     if (!sched_alloc_safe(ctx, ctx->sched_dec_step, gf, "decoder step")) {
-        ggml_free(gctx);
         return false;
     }
 
@@ -2432,7 +2499,6 @@ static bool run_decoder_step(
     // Compute
     if (!sched_compute_safe(ctx, ctx->sched_dec_step, gf, "decoder step")) {
         ggml_backend_sched_reset(ctx->sched_dec_step);
-        ggml_free(gctx);
         return false;
     }
 
@@ -2442,7 +2508,6 @@ static bool run_decoder_step(
     ctx->kv_used += 1;
 
     ggml_backend_sched_reset(ctx->sched_dec_step);
-    ggml_free(gctx);
 
     return true;
 }
@@ -2659,6 +2724,18 @@ struct voxtral_stream {
     std::string emitted_text;
 };
 
+static float compute_rms(const float * x, int32_t n) {
+    if (!x || n <= 0) {
+        return 0.0f;
+    }
+    double acc = 0.0;
+    for (int32_t i = 0; i < n; ++i) {
+        const double v = x[i];
+        acc += v * v;
+    }
+    return (float) std::sqrt(acc / (double) n);
+}
+
 static std::string text_delta(const std::string & prev, const std::string & cur) {
     // Rolling windows can drop earlier prefix text; stitch by suffix/prefix overlap.
     const size_t max_k = std::min(prev.size(), cur.size());
@@ -2746,6 +2823,21 @@ static bool voxtral_stream_decode_impl(
     }
     if (!force && stream->pending_samples < stream->params.min_decode_samples) {
         return false;
+    }
+
+    // CPU guard: skip expensive decode on near-silent new audio.
+    // This significantly reduces wasted encoder passes during pauses.
+    {
+        constexpr float kSilenceRms = 0.0035f;
+        const int32_t n = std::min<int32_t>(stream->pending_samples, (int32_t) stream->pcm_buffer.size());
+        if (n > 0) {
+            const float * tail = stream->pcm_buffer.data() + (stream->pcm_buffer.size() - (size_t) n);
+            const float rms = compute_rms(tail, n);
+            if (rms < kSilenceRms) {
+                stream->pending_samples = 0;
+                return false;
+            }
+        }
     }
 
     // Bound generation length by current window duration to reduce decode latency.
