@@ -128,8 +128,8 @@ struct voxtral_stream;
 
 struct voxtral_stream_params {
     int32_t max_tokens         = 128;
-    int32_t min_decode_samples = VOXTRAL_SAMPLE_RATE * 2;   // decode cadence threshold
-    int32_t max_buffer_samples = VOXTRAL_SAMPLE_RATE * 12;  // rolling PCM buffer
+    int32_t min_decode_samples = VOXTRAL_SAMPLE_RATE / 2;   // decode cadence threshold (~500 ms)
+    int32_t max_buffer_samples = VOXTRAL_SAMPLE_RATE * 3;   // rolling PCM buffer (~3 s)
 };
 
 // ============================================================================

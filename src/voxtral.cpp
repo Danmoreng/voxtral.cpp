@@ -2550,12 +2550,15 @@ struct voxtral_stream {
 };
 
 static std::string text_delta(const std::string & prev, const std::string & cur) {
-    size_t i = 0;
-    const size_t n = std::min(prev.size(), cur.size());
-    while (i < n && prev[i] == cur[i]) {
-        ++i;
+    // Rolling windows can drop earlier prefix text; stitch by suffix/prefix overlap.
+    const size_t max_k = std::min(prev.size(), cur.size());
+    size_t best = 0;
+    for (size_t k = 1; k <= max_k; ++k) {
+        if (prev.compare(prev.size() - k, k, cur, 0, k) == 0) {
+            best = k;
+        }
     }
-    return cur.substr(i);
+    return cur.substr(best);
 }
 
 voxtral_stream * voxtral_stream_create(
@@ -2571,10 +2574,13 @@ voxtral_stream * voxtral_stream_create(
         stream->params.max_tokens = 128;
     }
     if (stream->params.min_decode_samples <= 0) {
-        stream->params.min_decode_samples = VOXTRAL_SAMPLE_RATE * 2;
+        stream->params.min_decode_samples = VOXTRAL_SAMPLE_RATE / 2;
     }
     if (stream->params.max_buffer_samples <= 0) {
-        stream->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE * 12;
+        stream->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE * 3;
+    }
+    if (stream->params.max_buffer_samples < stream->params.min_decode_samples) {
+        stream->params.max_buffer_samples = stream->params.min_decode_samples;
     }
     return stream;
 }
