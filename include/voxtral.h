@@ -131,6 +131,26 @@ struct voxtral_stream_params {
     int32_t min_decode_samples    = VOXTRAL_SAMPLE_RATE;     // decode cadence threshold (~1.0 s)
     int32_t max_buffer_samples    = VOXTRAL_SAMPLE_RATE * 2; // rolling PCM buffer (~2 s)
     int32_t early_stop_pad_tokens = 8;                       // shorter decode tail in streaming mode
+    float   silence_rms_threshold = 0.0035f;                 // skip decode if pending tail RMS is below threshold
+    int32_t decoder_step_cache_capacity = 96;                // max cached decoder-step graphs
+    bool    low_latency_preset = false;                      // if true, apply conservative live defaults
+};
+
+struct voxtral_stream_stats {
+    uint64_t decode_calls = 0;
+    uint64_t decode_success = 0;
+    uint64_t skipped_cadence = 0;
+    uint64_t skipped_silence = 0;
+    uint64_t failures = 0;
+    int32_t  last_audio_samples = 0;
+    int32_t  last_generated_tokens = 0;
+    double   last_total_ms = 0.0;
+    double   last_encoder_ms = 0.0;
+    double   last_adapter_ms = 0.0;
+    double   last_prefill_ms = 0.0;
+    double   last_decode_ms = 0.0;
+    double   last_decode_ms_per_step = 0.0;
+    double   last_rtf = 0.0;
 };
 
 // ============================================================================
@@ -182,6 +202,10 @@ bool voxtral_stream_decode(
 bool voxtral_stream_flush(
     voxtral_stream * stream,
     voxtral_result & out_partial);
+
+bool voxtral_stream_get_stats(
+    const voxtral_stream * stream,
+    voxtral_stream_stats & out_stats);
 
 #endif // __cplusplus
 

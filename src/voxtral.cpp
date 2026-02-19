@@ -2523,7 +2523,8 @@ static bool voxtral_transcribe_from_audio(
     int32_t           max_tokens,
     voxtral_result  & result,
     bool              log_audio,
-    int32_t           early_stop_pad_tokens = VOXTRAL_N_RIGHT_PAD_TOKENS)
+    int32_t           early_stop_pad_tokens = VOXTRAL_N_RIGHT_PAD_TOKENS,
+    voxtral_stream_stats * stream_stats = nullptr)
 {
     result.text.clear();
     result.tokens.clear();
@@ -2587,14 +2588,22 @@ static bool voxtral_transcribe_from_audio(
     if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames)) {
         return false;
     }
-    LOG_INFO(&ctx, "encoder time: %.1f ms", elapsed_ms(t_encoder));
+    const double encoder_ms = elapsed_ms(t_encoder);
+    LOG_INFO(&ctx, "encoder time: %.1f ms", encoder_ms);
+    if (stream_stats) {
+        stream_stats->last_encoder_ms = encoder_ms;
+    }
 
     // 5. Run adapter
     auto t_adapter = std::chrono::steady_clock::now();
     if (!run_adapter(&ctx)) {
         return false;
     }
-    LOG_INFO(&ctx, "adapter time: %.1f ms", elapsed_ms(t_adapter));
+    const double adapter_ms = elapsed_ms(t_adapter);
+    LOG_INFO(&ctx, "adapter time: %.1f ms", adapter_ms);
+    if (stream_stats) {
+        stream_stats->last_adapter_ms = adapter_ms;
+    }
 
     const int32_t n_audio = ctx.dec_seq_len;
 
@@ -2629,7 +2638,11 @@ static bool voxtral_transcribe_from_audio(
     if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data())) {
         return false;
     }
-    LOG_INFO(&ctx, "prefill time: %.1f ms", elapsed_ms(t_prefill));
+    const double prefill_ms = elapsed_ms(t_prefill);
+    LOG_INFO(&ctx, "prefill time: %.1f ms", prefill_ms);
+    if (stream_stats) {
+        stream_stats->last_prefill_ms = prefill_ms;
+    }
 
     // First token from prefill
     int32_t token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
@@ -2671,9 +2684,15 @@ static bool voxtral_transcribe_from_audio(
             break;
         }
     }
+    const double decode_ms = elapsed_ms(t_decode);
+    const double decode_ms_per_step =
+        result.tokens.size() > 1 ? decode_ms / (result.tokens.size() - 1) : 0.0;
     LOG_INFO(&ctx, "decode time: %.1f ms (%d steps, %.1f ms/step)",
-        elapsed_ms(t_decode), (int)result.tokens.size() - 1,
-        result.tokens.size() > 1 ? elapsed_ms(t_decode) / (result.tokens.size() - 1) : 0.0);
+        decode_ms, (int)result.tokens.size() - 1, decode_ms_per_step);
+    if (stream_stats) {
+        stream_stats->last_decode_ms = decode_ms;
+        stream_stats->last_decode_ms_per_step = decode_ms_per_step;
+    }
 
     // Remove trailing EOS
     if (!result.tokens.empty() && result.tokens.back() == VOXTRAL_TOKEN_EOS) {
@@ -2681,6 +2700,9 @@ static bool voxtral_transcribe_from_audio(
     }
 
     LOG_INFO(&ctx, "generated %d tokens", (int)result.tokens.size());
+    if (stream_stats) {
+        stream_stats->last_generated_tokens = (int32_t) result.tokens.size();
+    }
 
     // 10. Decode tokens to text (Tekken vocab from GGUF metadata)
     result.text = decode_tokens(*ctx.model, result.tokens);
@@ -2722,6 +2744,7 @@ struct voxtral_stream {
     std::vector<float> pcm_buffer;
     int32_t pending_samples = 0;
     std::string emitted_text;
+    voxtral_stream_stats stats;
 };
 
 static float compute_rms(const float * x, int32_t n) {
@@ -2757,6 +2780,12 @@ voxtral_stream * voxtral_stream_create(
     voxtral_stream * stream = new voxtral_stream();
     stream->ctx = ctx;
     stream->params = params;
+    if (stream->params.low_latency_preset) {
+        stream->params.max_tokens = 48;
+        stream->params.min_decode_samples = VOXTRAL_SAMPLE_RATE / 2;
+        stream->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE * 2;
+        stream->params.early_stop_pad_tokens = 8;
+    }
     if (stream->params.max_tokens <= 0) {
         stream->params.max_tokens = 64;
     }
@@ -2772,6 +2801,13 @@ voxtral_stream * voxtral_stream_create(
     if (stream->params.early_stop_pad_tokens <= 0) {
         stream->params.early_stop_pad_tokens = 8;
     }
+    if (stream->params.silence_rms_threshold < 0.0f) {
+        stream->params.silence_rms_threshold = 0.0035f;
+    }
+    if (stream->params.decoder_step_cache_capacity > 0 && stream->ctx) {
+        stream->ctx->dec_step_cache_capacity = stream->params.decoder_step_cache_capacity;
+        clear_decoder_step_cache(stream->ctx);
+    }
     return stream;
 }
 
@@ -2784,6 +2820,7 @@ void voxtral_stream_reset(voxtral_stream * stream) {
     stream->pcm_buffer.clear();
     stream->pending_samples = 0;
     stream->emitted_text.clear();
+    stream->stats = {};
 }
 
 bool voxtral_stream_push_pcm(
@@ -2821,20 +2858,22 @@ static bool voxtral_stream_decode_impl(
     if (!stream || !stream->ctx || stream->pcm_buffer.empty()) {
         return false;
     }
+    stream->stats.decode_calls++;
     if (!force && stream->pending_samples < stream->params.min_decode_samples) {
+        stream->stats.skipped_cadence++;
         return false;
     }
 
     // CPU guard: skip expensive decode on near-silent new audio.
     // This significantly reduces wasted encoder passes during pauses.
     {
-        constexpr float kSilenceRms = 0.0035f;
         const int32_t n = std::min<int32_t>(stream->pending_samples, (int32_t) stream->pcm_buffer.size());
         if (n > 0) {
             const float * tail = stream->pcm_buffer.data() + (stream->pcm_buffer.size() - (size_t) n);
             const float rms = compute_rms(tail, n);
-            if (rms < kSilenceRms) {
+            if (rms < stream->params.silence_rms_threshold) {
                 stream->pending_samples = 0;
+                stream->stats.skipped_silence++;
                 return false;
             }
         }
@@ -2847,6 +2886,8 @@ static bool voxtral_stream_decode_impl(
         (int32_t) std::ceil(audio_seconds * 10.0f) + 8);
     const int32_t effective_max_tokens = std::min(stream->params.max_tokens, dynamic_cap);
 
+    auto t_total = std::chrono::steady_clock::now();
+    stream->stats.last_audio_samples = (int32_t) stream->pcm_buffer.size();
     voxtral_result full;
     if (!voxtral_transcribe_from_audio(
         *stream->ctx,
@@ -2855,9 +2896,15 @@ static bool voxtral_stream_decode_impl(
         effective_max_tokens,
         full,
         true,
-        stream->params.early_stop_pad_tokens)) {
+        stream->params.early_stop_pad_tokens,
+        &stream->stats)) {
+        stream->stats.failures++;
         return false;
     }
+    stream->stats.decode_success++;
+    stream->stats.last_total_ms = elapsed_ms(t_total);
+    const double audio_s = (double) stream->stats.last_audio_samples / (double) VOXTRAL_SAMPLE_RATE;
+    stream->stats.last_rtf = audio_s > 0.0 ? stream->stats.last_total_ms / (audio_s * 1000.0) : 0.0;
 
     out_partial = full;
     out_partial.text = text_delta(stream->emitted_text, full.text);
@@ -2876,4 +2923,14 @@ bool voxtral_stream_flush(
     voxtral_stream * stream,
     voxtral_result & out_partial) {
     return voxtral_stream_decode_impl(stream, out_partial, true);
+}
+
+bool voxtral_stream_get_stats(
+    const voxtral_stream * stream,
+    voxtral_stream_stats & out_stats) {
+    if (!stream) {
+        return false;
+    }
+    out_stats = stream->stats;
+    return true;
 }
