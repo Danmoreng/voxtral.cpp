@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <exception>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -212,6 +213,25 @@ struct voxtral_context {
     std::vector<uint8_t> dec_prefill_cached_meta;
     int32_t dec_prefill_cached_tokens = -1;
 };
+
+static bool sched_compute_safe(voxtral_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * gf, const char * stage) {
+    try {
+        ggml_backend_sched_graph_compute(sched, gf);
+        return true;
+    } catch (const std::exception & e) {
+        LOG_ERR(ctx, "%s: backend compute exception: %s", stage, e.what());
+        if (ctx && ctx->gpu_type == voxtral_gpu_backend::vulkan) {
+            LOG_WARN(ctx, "%s: Vulkan backend failed (likely driver/device lost). Prefer CPU/OpenCL on this device.", stage);
+        }
+        return false;
+    } catch (...) {
+        LOG_ERR(ctx, "%s: unknown backend compute exception", stage);
+        if (ctx && ctx->gpu_type == voxtral_gpu_backend::vulkan) {
+            LOG_WARN(ctx, "%s: Vulkan backend failed (likely driver/device lost). Prefer CPU/OpenCL on this device.", stage);
+        }
+        return false;
+    }
+}
 
 // ============================================================================
 // Mel filterbank computation (Slaney-style, matches Python reference)
@@ -1995,7 +2015,10 @@ static bool run_encoder_chunk(
     }
 
     // Compute
-    ggml_backend_sched_graph_compute(ctx->sched_encoder, gf);
+    if (!sched_compute_safe(ctx, ctx->sched_encoder, gf, "encoder chunk")) {
+        ggml_backend_sched_reset(ctx->sched_encoder);
+        return false;
+    }
     ggml_backend_sched_reset(ctx->sched_encoder);
 
     if (out_seq_len) *out_seq_len = chunk_seq_len;
@@ -2157,7 +2180,11 @@ static bool run_adapter(voxtral_context * ctx) {
         return false;
     }
 
-    ggml_backend_sched_graph_compute(ctx->sched_adapter, gf);
+    if (!sched_compute_safe(ctx, ctx->sched_adapter, gf, "adapter")) {
+        ggml_backend_sched_reset(ctx->sched_adapter);
+        ggml_free(gctx);
+        return false;
+    }
     ggml_backend_sched_reset(ctx->sched_adapter);
     ggml_free(gctx);
 
@@ -2260,7 +2287,10 @@ static bool run_decoder_prefill(
     }
 
     // Compute
-    ggml_backend_sched_graph_compute(ctx->sched_dec_pre, gf);
+    if (!sched_compute_safe(ctx, ctx->sched_dec_pre, gf, "decoder prefill")) {
+        ggml_backend_sched_reset(ctx->sched_dec_pre);
+        return false;
+    }
 
     // Read logits
     ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
@@ -2330,7 +2360,11 @@ static bool run_decoder_step(
     }
 
     // Compute
-    ggml_backend_sched_graph_compute(ctx->sched_dec_step, gf);
+    if (!sched_compute_safe(ctx, ctx->sched_dec_step, gf, "decoder step")) {
+        ggml_backend_sched_reset(ctx->sched_dec_step);
+        ggml_free(gctx);
+        return false;
+    }
 
     // Read logits
     ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
