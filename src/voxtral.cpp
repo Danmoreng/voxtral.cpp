@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <cstdio>
 #include <cstring>
@@ -46,6 +47,22 @@ static constexpr int32_t VOXTRAL_ENC_CHUNK_OVERLAP  = 750;  // overlap in encode
 static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens per single chunk
 
 static int32_t pick_default_threads();
+
+static void configure_android_vulkan_safety_env() {
+#ifdef __ANDROID__
+    auto set_if_unset = [](const char * key, const char * value) {
+        if (getenv(key) == nullptr) {
+            setenv(key, value, 0);
+        }
+    };
+    // Disable aggressive shader paths that are unstable on some mobile Vulkan drivers.
+    set_if_unset("GGML_VK_DISABLE_COOPMAT", "1");
+    set_if_unset("GGML_VK_DISABLE_COOPMAT2", "1");
+    set_if_unset("GGML_VK_DISABLE_INTEGER_DOT_PRODUCT", "1");
+    set_if_unset("GGML_VK_DISABLE_BFLOAT16", "1");
+    set_if_unset("GGML_VK_DISABLE_ASYNC", "1");
+#endif
+}
 
 // ============================================================================
 // Logging helper
@@ -710,6 +727,7 @@ voxtral_model * voxtral_model_load_from_file(
 
     auto try_vulkan = [&]() -> bool {
 #ifdef GGML_USE_VULKAN
+        configure_android_vulkan_safety_env();
         weights_backend = ggml_backend_vk_init(0);
         if (weights_backend) { resolved_gpu = voxtral_gpu_backend::vulkan; return true; }
         log_info("Vulkan backend init failed");
@@ -974,6 +992,7 @@ voxtral_context * voxtral_init_from_model(
     };
     auto try_vulkan_ctx = [&]() -> bool {
 #ifdef GGML_USE_VULKAN
+        configure_android_vulkan_safety_env();
         ctx->backend = ggml_backend_vk_init(0);
         if (ctx->backend) { ctx->gpu_type = voxtral_gpu_backend::vulkan; return true; }
         LOG_WARN(ctx, "Vulkan backend init failed");
