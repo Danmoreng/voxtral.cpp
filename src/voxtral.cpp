@@ -1013,8 +1013,17 @@ voxtral_context * voxtral_init_from_model(
             VOXTRAL_VOCAB_SIZE);
         ggml_set_name(ctx->decoder_logits, "decoder_logits");
 
-        const int32_t req_kv_window = params.kv_window_override > 0 ?
-            params.kv_window_override : VOXTRAL_DEC_WINDOW;
+        int32_t req_kv_window = params.kv_window_override;
+#ifdef __ANDROID__
+        if (req_kv_window <= 0) {
+            // Safer default for mobile memory footprint.
+            req_kv_window = 2048;
+            LOG_INFO(ctx, "kv_window_override not set; using Android default kv_window=%d", req_kv_window);
+        }
+#endif
+        if (req_kv_window <= 0) {
+            req_kv_window = VOXTRAL_DEC_WINDOW;
+        }
         ctx->kv_window = std::max<int32_t>(1, std::min<int32_t>(req_kv_window, VOXTRAL_DEC_WINDOW));
 
         // KV cache: [kv_dim, kv_window, dec_layers]
