@@ -134,6 +134,7 @@ struct voxtral_stream_params {
     float   silence_rms_threshold = 0.0035f;                 // skip decode if pending tail RMS is below threshold
     int32_t decoder_step_cache_capacity = 96;                // max cached decoder-step graphs
     bool    low_latency_preset = false;                      // if true, apply conservative live defaults
+    bool    experimental_incremental_encoder = false;        // WIP: reuse encoder prefix and re-encode suffix only
 };
 
 struct voxtral_stream_stats {

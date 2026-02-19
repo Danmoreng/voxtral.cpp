@@ -2405,6 +2405,43 @@ static bool run_decoder_prefill(
     return true;
 }
 
+static bool copy_encoder_output_to_cpu(
+    voxtral_context * ctx,
+    int32_t n_tokens,
+    std::vector<float> & out) {
+    if (!ctx || !ctx->encoder_output || n_tokens <= 0) {
+        return false;
+    }
+    const size_t elems = (size_t) VOXTRAL_ENC_DIM * (size_t) n_tokens;
+    out.resize(elems);
+    const size_t bytes = elems * sizeof(float);
+    if (ctx->gpu_type == voxtral_gpu_backend::none && ctx->encoder_output->data != nullptr) {
+        memcpy(out.data(), ctx->encoder_output->data, bytes);
+    } else {
+        ggml_backend_tensor_get(ctx->encoder_output, out.data(), 0, bytes);
+    }
+    return true;
+}
+
+static bool copy_cpu_to_encoder_output(
+    voxtral_context * ctx,
+    const float * src,
+    int32_t n_tokens,
+    int32_t dst_token_offset) {
+    if (!ctx || !ctx->encoder_output || !src || n_tokens <= 0 || dst_token_offset < 0) {
+        return false;
+    }
+    const size_t elem_bytes = (size_t) VOXTRAL_ENC_DIM * sizeof(float);
+    const size_t dst_offset = (size_t) dst_token_offset * elem_bytes;
+    const size_t copy_bytes = (size_t) n_tokens * elem_bytes;
+    if (ctx->gpu_type == voxtral_gpu_backend::none && ctx->encoder_output->data != nullptr) {
+        memcpy((uint8_t *) ctx->encoder_output->data + dst_offset, src, copy_bytes);
+    } else {
+        ggml_backend_tensor_set(ctx->encoder_output, src, dst_offset, copy_bytes);
+    }
+    return true;
+}
+
 // ============================================================================
 // Run Decoder Step
 // ============================================================================
@@ -2516,6 +2553,14 @@ static bool run_decoder_step(
 // High-level: Transcribe
 // ============================================================================
 
+struct voxtral_incremental_encoder_state {
+    bool valid = false;
+    bool buffer_dropped = false;
+    int32_t prev_n_frames = 0;
+    int32_t prev_enc_tokens = 0;
+    std::vector<float> prev_encoder_tokens;
+};
+
 static bool voxtral_transcribe_from_audio(
     voxtral_context & ctx,
     const float     * audio,
@@ -2524,7 +2569,8 @@ static bool voxtral_transcribe_from_audio(
     voxtral_result  & result,
     bool              log_audio,
     int32_t           early_stop_pad_tokens = VOXTRAL_N_RIGHT_PAD_TOKENS,
-    voxtral_stream_stats * stream_stats = nullptr)
+    voxtral_stream_stats * stream_stats = nullptr,
+    voxtral_incremental_encoder_state * inc_state = nullptr)
 {
     result.text.clear();
     result.tokens.clear();
@@ -2585,13 +2631,67 @@ static bool voxtral_transcribe_from_audio(
 
     // 4. Run encoder (chunked for arbitrarily long audio)
     auto t_encoder = std::chrono::steady_clock::now();
-    if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames)) {
-        return false;
+    bool encoder_ok = false;
+    bool used_incremental_encoder = false;
+    if (inc_state &&
+        inc_state->valid &&
+        !inc_state->buffer_dropped &&
+        n_frames > inc_state->prev_n_frames &&
+        inc_state->prev_enc_tokens > 0) {
+        constexpr int32_t REENCODE_OVERLAP_MEL = 512;
+        int32_t cut_frames = std::max<int32_t>(0, inc_state->prev_n_frames - REENCODE_OVERLAP_MEL);
+        if (cut_frames < n_frames) {
+            const int32_t suffix_frames = n_frames - cut_frames;
+            std::vector<float> mel_suffix((size_t) VOXTRAL_NUM_MEL_BINS * (size_t) suffix_frames);
+            for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; ++m) {
+                memcpy(mel_suffix.data() + (size_t) m * (size_t) suffix_frames,
+                       mel_data.data() + (size_t) m * (size_t) n_frames + (size_t) cut_frames,
+                       (size_t) suffix_frames * sizeof(float));
+            }
+
+            if (run_encoder_chunked(&ctx, mel_suffix.data(), suffix_frames)) {
+                const int32_t suffix_tokens = ctx.enc_seq_used;
+                int32_t prefix_tokens = mel_frames_to_enc_tokens(cut_frames);
+                prefix_tokens = (prefix_tokens / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
+                prefix_tokens = std::min(prefix_tokens, inc_state->prev_enc_tokens);
+                prefix_tokens = std::max(prefix_tokens, 0);
+
+                std::vector<float> suffix_cpu;
+                if (copy_encoder_output_to_cpu(&ctx, suffix_tokens, suffix_cpu) &&
+                    alloc_encoder_output(&ctx, prefix_tokens + suffix_tokens) &&
+                    (prefix_tokens == 0 || copy_cpu_to_encoder_output(&ctx, inc_state->prev_encoder_tokens.data(), prefix_tokens, 0)) &&
+                    copy_cpu_to_encoder_output(&ctx, suffix_cpu.data(), suffix_tokens, prefix_tokens)) {
+                    ctx.enc_seq_used = prefix_tokens + suffix_tokens;
+                    ctx.total_enc_tokens = ctx.enc_seq_used;
+                    used_incremental_encoder = true;
+                    encoder_ok = true;
+                    LOG_INFO(&ctx, "encoder incremental: cut_frames=%d prefix_tokens=%d suffix_tokens=%d total=%d",
+                        cut_frames, prefix_tokens, suffix_tokens, ctx.enc_seq_used);
+                }
+            }
+        }
+    }
+    if (!encoder_ok) {
+        if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames)) {
+            if (inc_state) {
+                inc_state->valid = false;
+            }
+            return false;
+        }
+        encoder_ok = true;
     }
     const double encoder_ms = elapsed_ms(t_encoder);
     LOG_INFO(&ctx, "encoder time: %.1f ms", encoder_ms);
     if (stream_stats) {
         stream_stats->last_encoder_ms = encoder_ms;
+    }
+    if (inc_state) {
+        inc_state->prev_n_frames = n_frames;
+        inc_state->prev_enc_tokens = ctx.enc_seq_used;
+        inc_state->valid = copy_encoder_output_to_cpu(&ctx, ctx.enc_seq_used, inc_state->prev_encoder_tokens);
+        if (used_incremental_encoder) {
+            inc_state->buffer_dropped = false;
+        }
     }
 
     // 5. Run adapter
@@ -2745,6 +2845,7 @@ struct voxtral_stream {
     int32_t pending_samples = 0;
     std::string emitted_text;
     voxtral_stream_stats stats;
+    voxtral_incremental_encoder_state enc_state;
 };
 
 static float compute_rms(const float * x, int32_t n) {
@@ -2821,6 +2922,7 @@ void voxtral_stream_reset(voxtral_stream * stream) {
     stream->pending_samples = 0;
     stream->emitted_text.clear();
     stream->stats = {};
+    stream->enc_state = {};
 }
 
 bool voxtral_stream_push_pcm(
@@ -2842,6 +2944,8 @@ bool voxtral_stream_push_pcm(
             (stream->pcm_buffer.size() - (size_t) drop) * sizeof(float));
         stream->pcm_buffer.resize(stream->params.max_buffer_samples);
         stream->pending_samples = std::max<int32_t>(0, stream->pending_samples - drop);
+        stream->enc_state.buffer_dropped = true;
+        stream->enc_state.valid = false;
     }
 
     return true;
@@ -2897,8 +3001,10 @@ static bool voxtral_stream_decode_impl(
         full,
         true,
         stream->params.early_stop_pad_tokens,
-        &stream->stats)) {
+        &stream->stats,
+        stream->params.experimental_incremental_encoder ? &stream->enc_state : nullptr)) {
         stream->stats.failures++;
+        stream->enc_state.valid = false;
         return false;
     }
     stream->stats.decode_success++;
