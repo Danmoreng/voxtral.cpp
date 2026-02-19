@@ -1988,31 +1988,17 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
                  chunk_idx, mel_offset, mel_offset + chunk_mel_frames,
                  chunk_seq_len, skip, stride, rope_offset);
 
-        // Copy stride portion from encoder_chunk_output to encoder_output on backend buffers.
+        // Copy stride portion from encoder_chunk_output to encoder_output.
+        // Use get/set for broad backend compatibility.
         {
             const size_t elem_bytes = VOXTRAL_ENC_DIM * sizeof(float);
             const size_t src_offset = (size_t) skip * elem_bytes;
             const size_t dst_offset = (size_t) enc_write_offset * elem_bytes;
-            ggml_init_params p_view = {
-                /*.mem_size  =*/ ggml_tensor_overhead() * 2,
-                /*.mem_buffer=*/ nullptr,
-                /*.no_alloc  =*/ true,
-            };
-            ggml_context * gview = ggml_init(p_view);
-            if (!gview) {
-                LOG_ERR(ctx, "encoder chunk %d: failed to init view context", chunk_idx);
-                return false;
-            }
+            const size_t copy_bytes = (size_t) stride * elem_bytes;
 
-            ggml_tensor * src_view = ggml_view_2d(
-                gview, ctx->encoder_chunk_output, VOXTRAL_ENC_DIM, stride,
-                ctx->encoder_chunk_output->nb[1], src_offset);
-            ggml_tensor * dst_view = ggml_view_2d(
-                gview, ctx->encoder_output, VOXTRAL_ENC_DIM, stride,
-                ctx->encoder_output->nb[1], dst_offset);
-
-            ggml_backend_tensor_copy(src_view, dst_view);
-            ggml_free(gview);
+            std::vector<uint8_t> tmp(copy_bytes);
+            ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), src_offset, copy_bytes);
+            ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
         }
 
         enc_write_offset += stride;
