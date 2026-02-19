@@ -127,9 +127,10 @@ struct voxtral_context;
 struct voxtral_stream;
 
 struct voxtral_stream_params {
-    int32_t max_tokens         = 128;
-    int32_t min_decode_samples = VOXTRAL_SAMPLE_RATE / 2;   // decode cadence threshold (~500 ms)
-    int32_t max_buffer_samples = VOXTRAL_SAMPLE_RATE * 3;   // rolling PCM buffer (~3 s)
+    int32_t max_tokens            = 64;
+    int32_t min_decode_samples    = VOXTRAL_SAMPLE_RATE;     // decode cadence threshold (~1.0 s)
+    int32_t max_buffer_samples    = VOXTRAL_SAMPLE_RATE * 2; // rolling PCM buffer (~2 s)
+    int32_t early_stop_pad_tokens = 8;                       // shorter decode tail in streaming mode
 };
 
 // ============================================================================

@@ -2353,7 +2353,8 @@ static bool voxtral_transcribe_from_audio(
     int32_t           n_samples,
     int32_t           max_tokens,
     voxtral_result  & result,
-    bool              log_audio)
+    bool              log_audio,
+    int32_t           early_stop_pad_tokens = VOXTRAL_N_RIGHT_PAD_TOKENS)
 {
     result.text.clear();
     result.tokens.clear();
@@ -2491,7 +2492,7 @@ static bool voxtral_transcribe_from_audio(
                 seen_text = true;
             }
         }
-        if (seen_text && consecutive_pad >= VOXTRAL_N_RIGHT_PAD_TOKENS) {
+        if (seen_text && consecutive_pad >= early_stop_pad_tokens) {
             LOG_INFO(&ctx, "early stop: %d consecutive pad tokens after text", consecutive_pad);
             break;
         }
@@ -2520,7 +2521,7 @@ bool voxtral_transcribe_audio(
     voxtral_result    & result)
 {
     return voxtral_transcribe_from_audio(
-        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, true);
+        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, true, VOXTRAL_N_RIGHT_PAD_TOKENS);
 }
 
 bool voxtral_transcribe_file(
@@ -2538,7 +2539,7 @@ bool voxtral_transcribe_file(
         (float)audio.size() / VOXTRAL_SAMPLE_RATE);
 
     return voxtral_transcribe_from_audio(
-        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, false);
+        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, false, VOXTRAL_N_RIGHT_PAD_TOKENS);
 }
 
 struct voxtral_stream {
@@ -2571,16 +2572,19 @@ voxtral_stream * voxtral_stream_create(
     stream->ctx = ctx;
     stream->params = params;
     if (stream->params.max_tokens <= 0) {
-        stream->params.max_tokens = 128;
+        stream->params.max_tokens = 64;
     }
     if (stream->params.min_decode_samples <= 0) {
-        stream->params.min_decode_samples = VOXTRAL_SAMPLE_RATE / 2;
+        stream->params.min_decode_samples = VOXTRAL_SAMPLE_RATE;
     }
     if (stream->params.max_buffer_samples <= 0) {
-        stream->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE * 3;
+        stream->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE * 2;
     }
     if (stream->params.max_buffer_samples < stream->params.min_decode_samples) {
         stream->params.max_buffer_samples = stream->params.min_decode_samples;
+    }
+    if (stream->params.early_stop_pad_tokens <= 0) {
+        stream->params.early_stop_pad_tokens = 8;
     }
     return stream;
 }
@@ -2642,7 +2646,8 @@ static bool voxtral_stream_decode_impl(
         (int32_t) stream->pcm_buffer.size(),
         stream->params.max_tokens,
         full,
-        true)) {
+        true,
+        stream->params.early_stop_pad_tokens)) {
         return false;
     }
 
