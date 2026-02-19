@@ -27,6 +27,7 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -42,6 +43,8 @@ static constexpr int32_t VOXTRAL_N_FREQ      = VOXTRAL_N_FFT / 2 + 1;      // 20
 static constexpr int32_t VOXTRAL_ENC_CHUNK_MEL     = 3000;  // mel frames per encoder chunk
 static constexpr int32_t VOXTRAL_ENC_CHUNK_OVERLAP  = 750;  // overlap in encoder-token space (= window)
 static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens per single chunk
+
+static int32_t pick_default_threads();
 
 // ============================================================================
 // Logging helper
@@ -168,11 +171,13 @@ struct voxtral_context {
     ggml_backend_buffer_t buf_enc_full = nullptr;
     ggml_tensor        * encoder_output = nullptr;  // [enc_dim, total_enc_tokens]
     int32_t total_enc_tokens = 0;
+    int32_t enc_capacity_tokens = 0;
 
     // Dynamic decoder memory (allocated per utterance ON DEVICE)
     ggml_context       * ctx_dec_mem = nullptr;
     ggml_backend_buffer_t buf_dec_mem = nullptr;
     ggml_tensor        * decoder_memory = nullptr;  // [dec_dim, dec_seq]
+    int32_t dec_capacity_tokens = 0;
 
     // Actual sizes (set per utterance)
     int32_t enc_seq_len  = 0;  // after conv, before left-trunc
@@ -194,6 +199,18 @@ struct voxtral_context {
     std::vector<float> mel_filters_cpu; // [n_freq * n_mel]
     std::vector<float> time_emb_cpu;    // [dec_dim]
     std::vector<float> logits_cpu;      // [vocab_size], reused across transcriptions
+
+    // Cached graphs
+    ggml_context * encoder_cached_gctx = nullptr;
+    ggml_cgraph  * encoder_cached_gf   = nullptr;
+    std::vector<uint8_t> encoder_cached_meta;
+    int32_t encoder_cached_mel_frames = -1;
+    int32_t encoder_cached_seq_len = 0;
+
+    ggml_context * dec_prefill_cached_gctx = nullptr;
+    ggml_cgraph  * dec_prefill_cached_gf   = nullptr;
+    std::vector<uint8_t> dec_prefill_cached_meta;
+    int32_t dec_prefill_cached_tokens = -1;
 };
 
 // ============================================================================
@@ -907,7 +924,10 @@ voxtral_context * voxtral_init_from_model(
     ctx->model     = model;
     ctx->log_level = params.log_level;
     ctx->logger    = params.logger;
-    ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+    ctx->n_threads = params.n_threads > 0 ? params.n_threads : pick_default_threads();
+    if (params.n_threads <= 0) {
+        LOG_INFO(ctx, "n_threads not set; using default=%d", ctx->n_threads);
+    }
 
     // Select GPU backend — inherit from model if params say none
     voxtral_gpu_backend gpu = params.gpu;
@@ -1100,8 +1120,24 @@ voxtral_context * voxtral_init_from_model(
     return ctx;
 }
 
+static int32_t pick_default_threads() {
+    unsigned int hc = std::thread::hardware_concurrency();
+    if (hc == 0) {
+        hc = 4;
+    }
+#ifdef __ANDROID__
+    // Leave headroom for UI/audio threads on mobile.
+    const int32_t target = (int32_t) hc - 2;
+    return std::max<int32_t>(2, std::min<int32_t>(target, 8));
+#else
+    return std::max<int32_t>(1, (int32_t) hc);
+#endif
+}
+
 void voxtral_free(voxtral_context * ctx) {
     if (!ctx) return;
+    if (ctx->encoder_cached_gctx)     ggml_free(ctx->encoder_cached_gctx);
+    if (ctx->dec_prefill_cached_gctx) ggml_free(ctx->dec_prefill_cached_gctx);
     if (ctx->sched_encoder)  ggml_backend_sched_free(ctx->sched_encoder);
     if (ctx->sched_adapter)  ggml_backend_sched_free(ctx->sched_adapter);
     if (ctx->sched_dec_pre)  ggml_backend_sched_free(ctx->sched_dec_pre);
@@ -1221,7 +1257,11 @@ static int32_t compute_total_enc_tokens(int32_t total_mel_frames) {
 
 // Allocate per-utterance encoder output buffer on device
 static bool alloc_encoder_output(voxtral_context * ctx, int32_t n_tokens) {
-    // Free previous allocation
+    if (ctx->encoder_output && ctx->enc_capacity_tokens >= n_tokens) {
+        ctx->total_enc_tokens = n_tokens;
+        return true;
+    }
+
     if (ctx->buf_enc_full) { ggml_backend_buffer_free(ctx->buf_enc_full); ctx->buf_enc_full = nullptr; }
     if (ctx->ctx_enc_full) { ggml_free(ctx->ctx_enc_full); ctx->ctx_enc_full = nullptr; }
     ctx->encoder_output = nullptr;
@@ -1238,12 +1278,18 @@ static bool alloc_encoder_output(voxtral_context * ctx, int32_t n_tokens) {
     ctx->buf_enc_full = ggml_backend_alloc_ctx_tensors(ctx->ctx_enc_full, ctx->backend);
     if (!ctx->buf_enc_full) return false;
 
+    ctx->enc_capacity_tokens = n_tokens;
     ctx->total_enc_tokens = n_tokens;
     return true;
 }
 
 // Allocate per-utterance decoder memory buffer on device
 static bool alloc_decoder_memory(voxtral_context * ctx, int32_t dec_seq) {
+    if (ctx->decoder_memory && ctx->dec_capacity_tokens >= dec_seq) {
+        ctx->dec_seq_len = dec_seq;
+        return true;
+    }
+
     if (ctx->buf_dec_mem) { ggml_backend_buffer_free(ctx->buf_dec_mem); ctx->buf_dec_mem = nullptr; }
     if (ctx->ctx_dec_mem) { ggml_free(ctx->ctx_dec_mem); ctx->ctx_dec_mem = nullptr; }
     ctx->decoder_memory = nullptr;
@@ -1260,7 +1306,17 @@ static bool alloc_decoder_memory(voxtral_context * ctx, int32_t dec_seq) {
     ctx->buf_dec_mem = ggml_backend_alloc_ctx_tensors(ctx->ctx_dec_mem, ctx->backend);
     if (!ctx->buf_dec_mem) return false;
 
+    ctx->dec_capacity_tokens = dec_seq;
     ctx->dec_seq_len = dec_seq;
+
+    // Decoder memory tensor changed -> invalidate prefill graph cache.
+    if (ctx->dec_prefill_cached_gctx) {
+        ggml_free(ctx->dec_prefill_cached_gctx);
+        ctx->dec_prefill_cached_gctx = nullptr;
+        ctx->dec_prefill_cached_gf = nullptr;
+        ctx->dec_prefill_cached_tokens = -1;
+        ctx->dec_prefill_cached_meta.clear();
+    }
     return true;
 }
 
@@ -1839,27 +1895,52 @@ static bool run_encoder_chunk(
     int32_t rope_pos_offset,
     int32_t * out_seq_len)
 {
-    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
-                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    static thread_local std::vector<uint8_t> encoder_meta_buf;
-    if (encoder_meta_buf.size() < meta_size) {
-        encoder_meta_buf.resize(meta_size);
+    ggml_cgraph * gf = nullptr;
+    int32_t chunk_seq_len = 0;
+
+    if (ctx->encoder_cached_gctx == nullptr || ctx->encoder_cached_mel_frames != chunk_mel_frames) {
+        if (ctx->encoder_cached_gctx) {
+            ggml_free(ctx->encoder_cached_gctx);
+            ctx->encoder_cached_gctx = nullptr;
+            ctx->encoder_cached_gf = nullptr;
+            ctx->encoder_cached_mel_frames = -1;
+            ctx->encoder_cached_seq_len = 0;
+            ctx->encoder_cached_meta.clear();
+        }
+
+        const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
+                                 ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
+        if (ctx->encoder_cached_meta.size() < meta_size) {
+            ctx->encoder_cached_meta.resize(meta_size);
+        }
+
+        ggml_init_params p = {
+            /*.mem_size  =*/ meta_size,
+            /*.mem_buffer=*/ ctx->encoder_cached_meta.data(),
+            /*.no_alloc  =*/ true,
+        };
+        ctx->encoder_cached_gctx = ggml_init(p);
+        if (!ctx->encoder_cached_gctx) {
+            LOG_ERR(ctx, "encoder chunk: failed to init cached graph context");
+            return false;
+        }
+
+        ctx->encoder_cached_gf = build_encoder_graph(ctx, ctx->encoder_cached_gctx, chunk_mel_data, chunk_mel_frames, &chunk_seq_len);
+        ctx->encoder_cached_mel_frames = chunk_mel_frames;
+        ctx->encoder_cached_seq_len = chunk_seq_len;
+    } else {
+        chunk_seq_len = ctx->encoder_cached_seq_len;
     }
 
-    ggml_init_params p = {
-        /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ encoder_meta_buf.data(),
-        /*.no_alloc  =*/ true,
-    };
-    ggml_context * gctx = ggml_init(p);
-
-    int32_t chunk_seq_len = 0;
-    ggml_cgraph * gf = build_encoder_graph(ctx, gctx, chunk_mel_data, chunk_mel_frames, &chunk_seq_len);
+    gf = ctx->encoder_cached_gf;
+    if (!gf) {
+        LOG_ERR(ctx, "encoder chunk: cached graph is null");
+        return false;
+    }
 
     ggml_backend_sched_reset(ctx->sched_encoder);
     if (!ggml_backend_sched_alloc_graph(ctx->sched_encoder, gf)) {
         LOG_ERR(ctx, "encoder chunk: failed to allocate graph");
-        ggml_free(gctx);
         return false;
     }
 
@@ -1872,7 +1953,11 @@ static bool run_encoder_chunk(
             ggml_backend_tensor_set(mel_t, chunk_mel_data, 0,
                 (size_t) VOXTRAL_NUM_MEL_BINS * chunk_mel_frames * sizeof(float));
         } else if (mel_t->ne[0] == expected_ne1 && mel_t->ne[1] == expected_ne0) {
-            std::vector<float> mel_tbuf((size_t) chunk_mel_frames * VOXTRAL_NUM_MEL_BINS);
+            static thread_local std::vector<float> mel_tbuf;
+            const size_t mel_size = (size_t) chunk_mel_frames * VOXTRAL_NUM_MEL_BINS;
+            if (mel_tbuf.size() < mel_size) {
+                mel_tbuf.resize(mel_size);
+            }
             for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; ++m) {
                 const float * src = chunk_mel_data + (size_t) m * chunk_mel_frames;
                 for (int32_t f = 0; f < chunk_mel_frames; ++f) {
@@ -1912,7 +1997,6 @@ static bool run_encoder_chunk(
     // Compute
     ggml_backend_sched_graph_compute(ctx->sched_encoder, gf);
     ggml_backend_sched_reset(ctx->sched_encoder);
-    ggml_free(gctx);
 
     if (out_seq_len) *out_seq_len = chunk_seq_len;
     return true;
@@ -2010,7 +2094,10 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
             const size_t dst_offset = (size_t) enc_write_offset * elem_bytes;
             const size_t copy_bytes = (size_t) stride * elem_bytes;
 
-            std::vector<uint8_t> tmp(copy_bytes);
+            static thread_local std::vector<uint8_t> tmp;
+            if (tmp.size() < copy_bytes) {
+                tmp.resize(copy_bytes);
+            }
             ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), src_offset, copy_bytes);
             ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
         }
@@ -2097,27 +2184,46 @@ static bool run_decoder_prefill(
         return false;
     }
 
-    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
-                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    static thread_local std::vector<uint8_t> prefill_meta_buf;
-    if (prefill_meta_buf.size() < meta_size) {
-        prefill_meta_buf.resize(meta_size);
+    ggml_cgraph * gf = nullptr;
+    if (ctx->dec_prefill_cached_gctx == nullptr || ctx->dec_prefill_cached_tokens != n_tokens) {
+        if (ctx->dec_prefill_cached_gctx) {
+            ggml_free(ctx->dec_prefill_cached_gctx);
+            ctx->dec_prefill_cached_gctx = nullptr;
+            ctx->dec_prefill_cached_gf = nullptr;
+            ctx->dec_prefill_cached_tokens = -1;
+            ctx->dec_prefill_cached_meta.clear();
+        }
+
+        const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
+                                 ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
+        if (ctx->dec_prefill_cached_meta.size() < meta_size) {
+            ctx->dec_prefill_cached_meta.resize(meta_size);
+        }
+
+        ggml_init_params p = {
+            /*.mem_size  =*/ meta_size,
+            /*.mem_buffer=*/ ctx->dec_prefill_cached_meta.data(),
+            /*.no_alloc  =*/ true,
+        };
+        ctx->dec_prefill_cached_gctx = ggml_init(p);
+        if (!ctx->dec_prefill_cached_gctx) {
+            LOG_ERR(ctx, "decoder prefill: failed to init cached graph context");
+            return false;
+        }
+        ctx->dec_prefill_cached_gf = build_decoder_prefill_graph(ctx, ctx->dec_prefill_cached_gctx, n_tokens);
+        ctx->dec_prefill_cached_tokens = n_tokens;
+        log_graph_info(ctx, "decoder prefill", ctx->dec_prefill_cached_gf);
     }
 
-    ggml_init_params p = {
-        /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ prefill_meta_buf.data(),
-        /*.no_alloc  =*/ true,
-    };
-    ggml_context * gctx = ggml_init(p);
-
-    ggml_cgraph * gf = build_decoder_prefill_graph(ctx, gctx, n_tokens);
-    log_graph_info(ctx, "decoder prefill", gf);
+    gf = ctx->dec_prefill_cached_gf;
+    if (!gf) {
+        LOG_ERR(ctx, "decoder prefill: cached graph is null");
+        return false;
+    }
 
     ggml_backend_sched_reset(ctx->sched_dec_pre);
     if (!ggml_backend_sched_alloc_graph(ctx->sched_dec_pre, gf)) {
         LOG_ERR(ctx, "decoder prefill: failed to allocate graph");
-        ggml_free(gctx);
         return false;
     }
 
@@ -2162,7 +2268,6 @@ static bool run_decoder_prefill(
     ctx->kv_used = std::min(n_tokens, ctx->kv_window);
 
     ggml_backend_sched_reset(ctx->sched_dec_pre);
-    ggml_free(gctx);
 
     LOG_INFO(ctx, "decoder prefill done");
     return true;
