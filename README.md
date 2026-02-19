@@ -50,7 +50,18 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 ./build/voxtral \
   --model models/voxtral/Q4_0.gguf \
   --audio path/to/input.wav \
-  --threads 8
+  --threads 8 \
+  --gpu auto
+```
+
+On Android/Adreno builds, prefer OpenCL and a smaller KV window:
+
+```bash
+./build/voxtral \
+  --model models/voxtral/Q4_0.gguf \
+  --audio path/to/input.wav \
+  --gpu opencl \
+  --kv-window 2048
 ```
 
 ---

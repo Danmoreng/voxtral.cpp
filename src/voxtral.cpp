@@ -10,6 +10,9 @@
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
+#ifdef GGML_USE_OPENCL
+#include "ggml-opencl.h"
+#endif
 #ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
 #endif
@@ -178,6 +181,7 @@ struct voxtral_context {
 
     // KV ring buffer state
     int32_t kv_used      = 0;  // tokens currently in KV cache
+    int32_t kv_window    = VOXTRAL_DEC_WINDOW;
 
     // Schedulers
     ggml_backend_sched_t sched_encoder  = nullptr;
@@ -674,6 +678,14 @@ voxtral_model * voxtral_model_load_from_file(
 #endif
         return false;
     };
+    auto try_opencl = [&]() -> bool {
+#ifdef GGML_USE_OPENCL
+        weights_backend = ggml_backend_opencl_init();
+        if (weights_backend) { resolved_gpu = voxtral_gpu_backend::opencl; return true; }
+        log_info("OpenCL backend init failed");
+#endif
+        return false;
+    };
 
     switch (gpu) {
         case voxtral_gpu_backend::cuda:
@@ -691,8 +703,17 @@ voxtral_model * voxtral_model_load_from_file(
                 log_info("Vulkan not available in this build, falling back to CPU");
             }
             break;
+        case voxtral_gpu_backend::opencl:
+            if (!try_opencl()) {
+                log_info("OpenCL not available in this build, falling back to CPU");
+            }
+            break;
         case voxtral_gpu_backend::auto_detect:
-            if (!try_cuda() && !try_metal() && !try_vulkan()) {
+#ifdef __ANDROID__
+            if (!try_opencl() && !try_vulkan() && !try_cuda() && !try_metal()) {
+#else
+            if (!try_cuda() && !try_metal() && !try_vulkan() && !try_opencl()) {
+#endif
                 log_info("no GPU backend available, using CPU");
             }
             break;
@@ -918,13 +939,26 @@ voxtral_context * voxtral_init_from_model(
 #endif
         return false;
     };
+    auto try_opencl_ctx = [&]() -> bool {
+#ifdef GGML_USE_OPENCL
+        ctx->backend = ggml_backend_opencl_init();
+        if (ctx->backend) { ctx->gpu_type = voxtral_gpu_backend::opencl; return true; }
+        LOG_WARN(ctx, "OpenCL backend init failed");
+#endif
+        return false;
+    };
 
     switch (gpu) {
         case voxtral_gpu_backend::cuda:    try_cuda_ctx();   break;
         case voxtral_gpu_backend::metal:   try_metal_ctx();  break;
         case voxtral_gpu_backend::vulkan:  try_vulkan_ctx(); break;
+        case voxtral_gpu_backend::opencl:  try_opencl_ctx(); break;
         case voxtral_gpu_backend::auto_detect:
-            if (!try_cuda_ctx() && !try_metal_ctx() && !try_vulkan_ctx()) {
+#ifdef __ANDROID__
+            if (!try_opencl_ctx() && !try_vulkan_ctx() && !try_cuda_ctx() && !try_metal_ctx()) {
+#else
+            if (!try_cuda_ctx() && !try_metal_ctx() && !try_vulkan_ctx() && !try_opencl_ctx()) {
+#endif
                 LOG_INFO(ctx, "no GPU backend available, using CPU");
             }
             break;
@@ -946,6 +980,7 @@ voxtral_context * voxtral_init_from_model(
         if (ctx->gpu_type == voxtral_gpu_backend::cuda)   gpu_name = "CUDA";
         if (ctx->gpu_type == voxtral_gpu_backend::metal)  gpu_name = "METAL";
         if (ctx->gpu_type == voxtral_gpu_backend::vulkan) gpu_name = "VULKAN";
+        if (ctx->gpu_type == voxtral_gpu_backend::opencl) gpu_name = "OPENCL";
         LOG_INFO(ctx, "backend: %s (CPU fallback %d threads)", gpu_name, ctx->n_threads);
     }
 
@@ -978,14 +1013,18 @@ voxtral_context * voxtral_init_from_model(
             VOXTRAL_VOCAB_SIZE);
         ggml_set_name(ctx->decoder_logits, "decoder_logits");
 
-        // KV cache: [kv_dim, dec_window, dec_layers]
+        const int32_t req_kv_window = params.kv_window_override > 0 ?
+            params.kv_window_override : VOXTRAL_DEC_WINDOW;
+        ctx->kv_window = std::max<int32_t>(1, std::min<int32_t>(req_kv_window, VOXTRAL_DEC_WINDOW));
+
+        // KV cache: [kv_dim, kv_window, dec_layers]
         const int32_t kv_dim = VOXTRAL_DEC_KV_HEADS * VOXTRAL_DEC_HEAD_DIM;  // 1024
-        ctx->kv_self_k = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
-            kv_dim, VOXTRAL_DEC_WINDOW, VOXTRAL_DEC_LAYERS);
+        ctx->kv_self_k = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F16,
+            kv_dim, ctx->kv_window, VOXTRAL_DEC_LAYERS);
         ggml_set_name(ctx->kv_self_k, "kv_self_k");
 
-        ctx->kv_self_v = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
-            kv_dim, VOXTRAL_DEC_WINDOW, VOXTRAL_DEC_LAYERS);
+        ctx->kv_self_v = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F16,
+            kv_dim, ctx->kv_window, VOXTRAL_DEC_LAYERS);
         ggml_set_name(ctx->kv_self_v, "kv_self_v");
 
         ctx->buf_persistent = ggml_backend_alloc_ctx_tensors(ctx->ctx_persistent, ctx->backend);
@@ -1002,8 +1041,8 @@ voxtral_context * voxtral_init_from_model(
     {
         const double chunk_mb = (double) ggml_nbytes(ctx->encoder_chunk_output) / 1e6;
         const double kv_mb  = (double) (ggml_nbytes(ctx->kv_self_k) + ggml_nbytes(ctx->kv_self_v)) / 1e6;
-        LOG_INFO(ctx, "buffers: encoder_chunk=%.2f MB kv_cache=%.2f MB",
-            chunk_mb, kv_mb);
+        LOG_INFO(ctx, "buffers: encoder_chunk=%.2f MB kv_cache=%.2f MB (kv_window=%d, kv_dtype=F16)",
+            chunk_mb, kv_mb, ctx->kv_window);
     }
 
     // Schedulers — ggml requires the last backend to be CPU.
@@ -1076,14 +1115,8 @@ static void clear_kv_cache(voxtral_context * ctx) {
     if (!ctx || !ctx->kv_self_k || !ctx->kv_self_v) {
         return;
     }
-    void * k_data = ggml_get_data(ctx->kv_self_k);
-    void * v_data = ggml_get_data(ctx->kv_self_v);
-    if (k_data) {
-        memset(k_data, 0, ggml_nbytes(ctx->kv_self_k));
-    }
-    if (v_data) {
-        memset(v_data, 0, ggml_nbytes(ctx->kv_self_v));
-    }
+    ggml_backend_tensor_memset(ctx->kv_self_k, 0, 0, ggml_nbytes(ctx->kv_self_k));
+    ggml_backend_tensor_memset(ctx->kv_self_v, 0, 0, ggml_nbytes(ctx->kv_self_v));
     ctx->kv_used = 0;
 }
 
@@ -1091,30 +1124,28 @@ static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
     if (!ctx || shift <= 0 || !ctx->kv_self_k || !ctx->kv_self_v) {
         return;
     }
-    const int32_t window = VOXTRAL_DEC_WINDOW;
+    const int32_t window = ctx->kv_window;
     if (shift >= window) {
         clear_kv_cache(ctx);
         return;
     }
-
-    uint8_t * k_data = (uint8_t *) ggml_get_data(ctx->kv_self_k);
-    uint8_t * v_data = (uint8_t *) ggml_get_data(ctx->kv_self_v);
-    if (!k_data || !v_data) {
-        return;
-    }
-
     const size_t row_bytes = ctx->kv_self_k->nb[1];
     const size_t layer_stride = ctx->kv_self_k->nb[2];
 
+    std::vector<uint8_t> tmp((size_t) (window - shift) * row_bytes);
     for (int32_t l = 0; l < VOXTRAL_DEC_LAYERS; ++l) {
-        uint8_t * k_base = k_data + (size_t) l * layer_stride;
-        uint8_t * v_base = v_data + (size_t) l * layer_stride;
+        const size_t layer_off = (size_t) l * layer_stride;
+        const size_t moved_bytes = (size_t) (window - shift) * row_bytes;
+        const size_t head_off = layer_off + (size_t) shift * row_bytes;
+        const size_t tail_off = layer_off + (size_t) (window - shift) * row_bytes;
 
-        memmove(k_base, k_base + (size_t) shift * row_bytes, (size_t) (window - shift) * row_bytes);
-        memmove(v_base, v_base + (size_t) shift * row_bytes, (size_t) (window - shift) * row_bytes);
+        ggml_backend_tensor_get(ctx->kv_self_k, tmp.data(), head_off, moved_bytes);
+        ggml_backend_tensor_set(ctx->kv_self_k, tmp.data(), layer_off, moved_bytes);
+        ggml_backend_tensor_memset(ctx->kv_self_k, 0, tail_off, (size_t) shift * row_bytes);
 
-        memset(k_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
-        memset(v_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
+        ggml_backend_tensor_get(ctx->kv_self_v, tmp.data(), head_off, moved_bytes);
+        ggml_backend_tensor_set(ctx->kv_self_v, tmp.data(), layer_off, moved_bytes);
+        ggml_backend_tensor_memset(ctx->kv_self_v, 0, tail_off, (size_t) shift * row_bytes);
     }
 }
 
@@ -1957,17 +1988,31 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
                  chunk_idx, mel_offset, mel_offset + chunk_mel_frames,
                  chunk_seq_len, skip, stride, rope_offset);
 
-        // Copy stride portion from encoder_chunk_output to encoder_output
-        // Goes through CPU (device->CPU->device), but stride data is small (~3.8 MB max)
+        // Copy stride portion from encoder_chunk_output to encoder_output on backend buffers.
         {
             const size_t elem_bytes = VOXTRAL_ENC_DIM * sizeof(float);
             const size_t src_offset = (size_t) skip * elem_bytes;
             const size_t dst_offset = (size_t) enc_write_offset * elem_bytes;
-            const size_t copy_bytes = (size_t) stride * elem_bytes;
+            ggml_init_params p_view = {
+                /*.mem_size  =*/ ggml_tensor_overhead() * 2,
+                /*.mem_buffer=*/ nullptr,
+                /*.no_alloc  =*/ true,
+            };
+            ggml_context * gview = ggml_init(p_view);
+            if (!gview) {
+                LOG_ERR(ctx, "encoder chunk %d: failed to init view context", chunk_idx);
+                return false;
+            }
 
-            std::vector<uint8_t> tmp(copy_bytes);
-            ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), src_offset, copy_bytes);
-            ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
+            ggml_tensor * src_view = ggml_view_2d(
+                gview, ctx->encoder_chunk_output, VOXTRAL_ENC_DIM, stride,
+                ctx->encoder_chunk_output->nb[1], src_offset);
+            ggml_tensor * dst_view = ggml_view_2d(
+                gview, ctx->encoder_output, VOXTRAL_ENC_DIM, stride,
+                ctx->encoder_output->nb[1], dst_offset);
+
+            ggml_backend_tensor_copy(src_view, dst_view);
+            ggml_free(gview);
         }
 
         enc_write_offset += stride;
@@ -2044,8 +2089,8 @@ static bool run_decoder_prefill(
 {
     LOG_INFO(ctx, "decoder prefill: %d tokens", n_tokens);
 
-    if (n_tokens > VOXTRAL_DEC_WINDOW) {
-        LOG_ERR(ctx, "decoder prefill: n_tokens=%d exceeds DEC_WINDOW=%d", n_tokens, VOXTRAL_DEC_WINDOW);
+    if (n_tokens > ctx->kv_window) {
+        LOG_ERR(ctx, "decoder prefill: n_tokens=%d exceeds kv_window=%d", n_tokens, ctx->kv_window);
         return false;
     }
 
@@ -2106,7 +2151,7 @@ static bool run_decoder_prefill(
     // Read logits
     ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
 
-    ctx->kv_used = std::min(n_tokens, VOXTRAL_DEC_WINDOW);
+    ctx->kv_used = std::min(n_tokens, ctx->kv_window);
 
     ggml_backend_sched_reset(ctx->sched_dec_pre);
     ggml_free(gctx);
@@ -2126,9 +2171,9 @@ static bool run_decoder_step(
     int32_t           audio_pos,    // position in adapter output for audio embedding
     float           * logits_out)   // [vocab_size]
 {
-    if (ctx->kv_used >= VOXTRAL_DEC_WINDOW) {
+    if (ctx->kv_used >= ctx->kv_window) {
         kv_cache_shift_left(ctx, 1);
-        ctx->kv_used = VOXTRAL_DEC_WINDOW - 1;
+        ctx->kv_used = ctx->kv_window - 1;
     }
 
     // Use thread-local buffer to avoid per-step heap allocation

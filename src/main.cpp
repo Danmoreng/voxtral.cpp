@@ -23,6 +23,7 @@ struct cli_params {
     std::string dump_tokens;
     std::string output_text;
     int32_t threads = 0;
+    int32_t kv_window_override = 0;
     uint32_t seed = 0;
     int32_t max_tokens = 256;
     voxtral_log_level log_level = voxtral_log_level::info;
@@ -211,7 +212,8 @@ void print_usage(const char * argv0) {
         << "  --dump-logits-bin P   write full step-0 logits as float32 raw bytes\n"
         << "  --dump-tokens PATH    write generated token ids as a single line\n"
         << "  --output-text PATH    write decoded text to file (still prints to stdout)\n"
-        << "  --gpu BACKEND         gpu backend: auto|cuda|metal|vulkan|none (default: none)\n"
+        << "  --gpu BACKEND         gpu backend: auto|cuda|metal|vulkan|opencl|none (default: none)\n"
+        << "  --kv-window N         runtime decoder KV window (0 uses model max)\n"
         << "  --metal               alias for --gpu metal\n"
         << "  -h, --help            show this help\n";
 }
@@ -243,6 +245,7 @@ bool parse_gpu(const std::string & s, voxtral_gpu_backend & out) {
     if (lc == "cuda")   { out = voxtral_gpu_backend::cuda;        return true; }
     if (lc == "metal")  { out = voxtral_gpu_backend::metal;       return true; }
     if (lc == "vulkan") { out = voxtral_gpu_backend::vulkan;      return true; }
+    if (lc == "opencl") { out = voxtral_gpu_backend::opencl;      return true; }
     return false;
 }
 
@@ -299,6 +302,12 @@ bool parse_args(int argc, char ** argv, cli_params & p) {
                 std::cerr << "invalid --threads\n";
                 return false;
             }
+        } else if (a == "--kv-window") {
+            const char * v = need_value("--kv-window");
+            if (!v || !parse_i32(v, p.kv_window_override) || p.kv_window_override < 0) {
+                std::cerr << "invalid --kv-window\n";
+                return false;
+            }
         } else if (a == "--seed") {
             const char * v = need_value("--seed");
             if (!v || !parse_u32(v, p.seed)) {
@@ -352,7 +361,7 @@ bool parse_args(int argc, char ** argv, cli_params & p) {
         } else if (a == "--gpu") {
             const char * v = need_value("--gpu");
             if (!v || !parse_gpu(v, p.gpu)) {
-                std::cerr << "invalid --gpu (expected: auto|cuda|metal|vulkan|none)\n";
+                std::cerr << "invalid --gpu (expected: auto|cuda|metal|vulkan|opencl|none)\n";
                 return false;
             }
         } else if (a == "--metal") {
@@ -427,6 +436,7 @@ int main(int argc, char ** argv) {
 
     voxtral_context_params ctx_p;
     ctx_p.n_threads = p.threads;
+    ctx_p.kv_window_override = p.kv_window_override;
     // ctx_p.seed = p.seed;
     ctx_p.log_level = p.log_level;
     ctx_p.logger = logger;

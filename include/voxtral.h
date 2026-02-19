@@ -86,6 +86,7 @@ enum class voxtral_gpu_backend : int {
     cuda,
     metal,
     vulkan,
+    opencl,
 };
 
 using voxtral_log_callback = std::function<void(voxtral_log_level, const std::string &)>;
@@ -102,6 +103,7 @@ struct voxtral_model;
 
 struct voxtral_context_params {
     int32_t              n_threads  = 0;
+    int32_t              kv_window_override = 0; // 0 = use VOXTRAL_DEC_WINDOW
     voxtral_log_level    log_level  = voxtral_log_level::info;
     voxtral_log_callback logger     = nullptr;
     voxtral_gpu_backend  gpu        = voxtral_gpu_backend::none;
