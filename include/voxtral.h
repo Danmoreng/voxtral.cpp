@@ -124,6 +124,13 @@ struct voxtral_result {
 // ============================================================================
 
 struct voxtral_context;
+struct voxtral_stream;
+
+struct voxtral_stream_params {
+    int32_t max_tokens         = 128;
+    int32_t min_decode_samples = VOXTRAL_SAMPLE_RATE * 2;   // decode cadence threshold
+    int32_t max_buffer_samples = VOXTRAL_SAMPLE_RATE * 12;  // rolling PCM buffer
+};
 
 // ============================================================================
 // Public API
@@ -153,6 +160,27 @@ bool voxtral_transcribe_audio(
     const std::vector<float> & audio,
     int32_t            max_tokens,
     voxtral_result   & result);
+
+voxtral_stream * voxtral_stream_create(
+    voxtral_context * ctx,
+    const voxtral_stream_params & params = {});
+
+void voxtral_stream_free(voxtral_stream * stream);
+
+void voxtral_stream_reset(voxtral_stream * stream);
+
+bool voxtral_stream_push_pcm(
+    voxtral_stream * stream,
+    const float * pcm,
+    int32_t n_samples);
+
+bool voxtral_stream_decode(
+    voxtral_stream * stream,
+    voxtral_result & out_partial);
+
+bool voxtral_stream_flush(
+    voxtral_stream * stream,
+    voxtral_result & out_partial);
 
 #endif // __cplusplus
 

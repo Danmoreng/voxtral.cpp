@@ -2540,3 +2540,121 @@ bool voxtral_transcribe_file(
     return voxtral_transcribe_from_audio(
         ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, false);
 }
+
+struct voxtral_stream {
+    voxtral_context * ctx = nullptr;
+    voxtral_stream_params params;
+    std::vector<float> pcm_buffer;
+    int32_t pending_samples = 0;
+    std::string emitted_text;
+};
+
+static std::string text_delta(const std::string & prev, const std::string & cur) {
+    size_t i = 0;
+    const size_t n = std::min(prev.size(), cur.size());
+    while (i < n && prev[i] == cur[i]) {
+        ++i;
+    }
+    return cur.substr(i);
+}
+
+voxtral_stream * voxtral_stream_create(
+    voxtral_context * ctx,
+    const voxtral_stream_params & params) {
+    if (!ctx) {
+        return nullptr;
+    }
+    voxtral_stream * stream = new voxtral_stream();
+    stream->ctx = ctx;
+    stream->params = params;
+    if (stream->params.max_tokens <= 0) {
+        stream->params.max_tokens = 128;
+    }
+    if (stream->params.min_decode_samples <= 0) {
+        stream->params.min_decode_samples = VOXTRAL_SAMPLE_RATE * 2;
+    }
+    if (stream->params.max_buffer_samples <= 0) {
+        stream->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE * 12;
+    }
+    return stream;
+}
+
+void voxtral_stream_free(voxtral_stream * stream) {
+    delete stream;
+}
+
+void voxtral_stream_reset(voxtral_stream * stream) {
+    if (!stream) return;
+    stream->pcm_buffer.clear();
+    stream->pending_samples = 0;
+    stream->emitted_text.clear();
+}
+
+bool voxtral_stream_push_pcm(
+    voxtral_stream * stream,
+    const float * pcm,
+    int32_t n_samples) {
+    if (!stream || !pcm || n_samples <= 0) {
+        return false;
+    }
+
+    const size_t old_size = stream->pcm_buffer.size();
+    stream->pcm_buffer.resize(old_size + (size_t) n_samples);
+    memcpy(stream->pcm_buffer.data() + old_size, pcm, (size_t) n_samples * sizeof(float));
+
+    stream->pending_samples += n_samples;
+    if ((int32_t) stream->pcm_buffer.size() > stream->params.max_buffer_samples) {
+        const int32_t drop = (int32_t) stream->pcm_buffer.size() - stream->params.max_buffer_samples;
+        memmove(stream->pcm_buffer.data(), stream->pcm_buffer.data() + drop,
+            (stream->pcm_buffer.size() - (size_t) drop) * sizeof(float));
+        stream->pcm_buffer.resize(stream->params.max_buffer_samples);
+        stream->pending_samples = std::max<int32_t>(0, stream->pending_samples - drop);
+    }
+
+    return true;
+}
+
+static bool voxtral_stream_decode_impl(
+    voxtral_stream * stream,
+    voxtral_result & out_partial,
+    bool force) {
+    out_partial.text.clear();
+    out_partial.tokens.clear();
+    out_partial.first_step_logits.clear();
+
+    if (!stream || !stream->ctx || stream->pcm_buffer.empty()) {
+        return false;
+    }
+    if (!force && stream->pending_samples < stream->params.min_decode_samples) {
+        return false;
+    }
+
+    voxtral_result full;
+    if (!voxtral_transcribe_from_audio(
+        *stream->ctx,
+        stream->pcm_buffer.data(),
+        (int32_t) stream->pcm_buffer.size(),
+        stream->params.max_tokens,
+        full,
+        true)) {
+        return false;
+    }
+
+    out_partial = full;
+    out_partial.text = text_delta(stream->emitted_text, full.text);
+    stream->emitted_text = full.text;
+    stream->pending_samples = 0;
+    return true;
+}
+
+bool voxtral_stream_decode(
+    voxtral_stream * stream,
+    voxtral_result & out_partial) {
+    return voxtral_stream_decode_impl(stream, out_partial, false);
+}
+
+bool voxtral_stream_flush(
+    voxtral_stream * stream,
+    voxtral_result & out_partial) {
+    return voxtral_stream_decode_impl(stream, out_partial, true);
+}
