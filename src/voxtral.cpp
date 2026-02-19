@@ -2934,3 +2934,15 @@ bool voxtral_stream_get_stats(
     out_stats = stream->stats;
     return true;
 }
+
+voxtral_stream_params voxtral_stream_params_android_cpu_live() {
+    voxtral_stream_params p;
+    p.max_tokens = 48;
+    p.min_decode_samples = VOXTRAL_SAMPLE_RATE / 2;  // 0.5 s
+    p.max_buffer_samples = VOXTRAL_SAMPLE_RATE * 5;  // 5.0 s
+    p.early_stop_pad_tokens = 8;
+    p.silence_rms_threshold = 0.0035f;
+    p.decoder_step_cache_capacity = 96;
+    p.low_latency_preset = false;
+    return p;
+}

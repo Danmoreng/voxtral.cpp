@@ -207,6 +207,10 @@ bool voxtral_stream_get_stats(
     const voxtral_stream * stream,
     voxtral_stream_stats & out_stats);
 
+// Convenience preset for Android CPU live transcription.
+// Can be used as a baseline and then overridden by app-specific tuning.
+voxtral_stream_params voxtral_stream_params_android_cpu_live();
+
 #endif // __cplusplus
 
 #endif // VOXTRAL_H
