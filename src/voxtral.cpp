@@ -229,7 +229,36 @@ struct voxtral_context {
     ggml_cgraph  * dec_prefill_cached_gf   = nullptr;
     std::vector<uint8_t> dec_prefill_cached_meta;
     int32_t dec_prefill_cached_tokens = -1;
+    bool backend_failed = false;
 };
+
+static bool sched_alloc_safe(voxtral_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * gf, const char * stage) {
+    try {
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            LOG_ERR(ctx, "%s: failed to allocate graph", stage);
+            return false;
+        }
+        return true;
+    } catch (const std::exception & e) {
+        LOG_ERR(ctx, "%s: backend alloc exception: %s", stage, e.what());
+        if (ctx && ctx->gpu_type == voxtral_gpu_backend::vulkan) {
+            LOG_WARN(ctx, "%s: Vulkan backend lost during graph alloc; marking backend failed", stage);
+        }
+        if (ctx) {
+            ctx->backend_failed = true;
+        }
+        return false;
+    } catch (...) {
+        LOG_ERR(ctx, "%s: unknown backend alloc exception", stage);
+        if (ctx && ctx->gpu_type == voxtral_gpu_backend::vulkan) {
+            LOG_WARN(ctx, "%s: Vulkan backend lost during graph alloc; marking backend failed", stage);
+        }
+        if (ctx) {
+            ctx->backend_failed = true;
+        }
+        return false;
+    }
+}
 
 static bool sched_compute_safe(voxtral_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * gf, const char * stage) {
     try {
@@ -240,11 +269,17 @@ static bool sched_compute_safe(voxtral_context * ctx, ggml_backend_sched_t sched
         if (ctx && ctx->gpu_type == voxtral_gpu_backend::vulkan) {
             LOG_WARN(ctx, "%s: Vulkan backend failed (likely driver/device lost). Prefer CPU/OpenCL on this device.", stage);
         }
+        if (ctx) {
+            ctx->backend_failed = true;
+        }
         return false;
     } catch (...) {
         LOG_ERR(ctx, "%s: unknown backend compute exception", stage);
         if (ctx && ctx->gpu_type == voxtral_gpu_backend::vulkan) {
             LOG_WARN(ctx, "%s: Vulkan backend failed (likely driver/device lost). Prefer CPU/OpenCL on this device.", stage);
+        }
+        if (ctx) {
+            ctx->backend_failed = true;
         }
         return false;
     }
@@ -1934,6 +1969,11 @@ static bool run_encoder_chunk(
     int32_t rope_pos_offset,
     int32_t * out_seq_len)
 {
+    if (ctx->backend_failed) {
+        LOG_ERR(ctx, "encoder chunk: backend is in failed state");
+        return false;
+    }
+
     ggml_cgraph * gf = nullptr;
     int32_t chunk_seq_len = 0;
 
@@ -1978,8 +2018,7 @@ static bool run_encoder_chunk(
     }
 
     ggml_backend_sched_reset(ctx->sched_encoder);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched_encoder, gf)) {
-        LOG_ERR(ctx, "encoder chunk: failed to allocate graph");
+    if (!sched_alloc_safe(ctx, ctx->sched_encoder, gf, "encoder chunk")) {
         return false;
     }
 
@@ -2163,6 +2202,11 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
 // ============================================================================
 
 static bool run_adapter(voxtral_context * ctx) {
+    if (ctx->backend_failed) {
+        LOG_ERR(ctx, "adapter: backend is in failed state");
+        return false;
+    }
+
     const int32_t enc_seq = ctx->enc_seq_used;
     const int32_t dec_seq = enc_seq / VOXTRAL_DOWNSAMPLE_FACTOR;
 
@@ -2193,8 +2237,7 @@ static bool run_adapter(voxtral_context * ctx) {
     log_graph_info(ctx, "adapter", gf);
 
     ggml_backend_sched_reset(ctx->sched_adapter);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched_adapter, gf)) {
-        LOG_ERR(ctx, "adapter: failed to allocate graph");
+    if (!sched_alloc_safe(ctx, ctx->sched_adapter, gf, "adapter")) {
         ggml_free(gctx);
         return false;
     }
@@ -2223,6 +2266,11 @@ static bool run_decoder_prefill(
     int32_t           n_tokens,
     float           * logits_out)  // [vocab_size]
 {
+    if (ctx->backend_failed) {
+        LOG_ERR(ctx, "decoder prefill: backend is in failed state");
+        return false;
+    }
+
     LOG_INFO(ctx, "decoder prefill: %d tokens", n_tokens);
 
     if (n_tokens > ctx->kv_window) {
@@ -2268,8 +2316,7 @@ static bool run_decoder_prefill(
     }
 
     ggml_backend_sched_reset(ctx->sched_dec_pre);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched_dec_pre, gf)) {
-        LOG_ERR(ctx, "decoder prefill: failed to allocate graph");
+    if (!sched_alloc_safe(ctx, ctx->sched_dec_pre, gf, "decoder prefill")) {
         return false;
     }
 
@@ -2333,6 +2380,11 @@ static bool run_decoder_step(
     int32_t           audio_pos,    // position in adapter output for audio embedding
     float           * logits_out)   // [vocab_size]
 {
+    if (ctx->backend_failed) {
+        LOG_ERR(ctx, "decoder step: backend is in failed state");
+        return false;
+    }
+
     if (ctx->kv_used >= ctx->kv_window) {
         kv_cache_shift_left(ctx, 1);
         ctx->kv_used = ctx->kv_window - 1;
@@ -2356,8 +2408,7 @@ static bool run_decoder_step(
     ggml_cgraph * gf = build_decoder_step_graph(ctx, gctx, position, audio_pos);
 
     ggml_backend_sched_reset(ctx->sched_dec_step);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched_dec_step, gf)) {
-        LOG_ERR(ctx, "decoder step: failed to allocate graph");
+    if (!sched_alloc_safe(ctx, ctx->sched_dec_step, gf, "decoder step")) {
         ggml_free(gctx);
         return false;
     }
@@ -2412,6 +2463,11 @@ static bool voxtral_transcribe_from_audio(
     result.text.clear();
     result.tokens.clear();
     result.first_step_logits.clear();
+
+    if (ctx.backend_failed) {
+        LOG_ERR(&ctx, "transcribe: backend is in failed state; reinitialize context with CPU/OpenCL");
+        return false;
+    }
 
     if (audio == nullptr || n_samples <= 0) {
         LOG_ERR(&ctx, "audio input is empty");
