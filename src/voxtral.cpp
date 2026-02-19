@@ -193,6 +193,7 @@ struct voxtral_context {
     std::vector<float> hann_window;     // [window_size]
     std::vector<float> mel_filters_cpu; // [n_freq * n_mel]
     std::vector<float> time_emb_cpu;    // [dec_dim]
+    std::vector<float> logits_cpu;      // [vocab_size], reused across transcriptions
 };
 
 // ============================================================================
@@ -1093,6 +1094,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Time embedding for t = N_DELAY_TOKENS
     compute_time_embedding(ctx->time_emb_cpu, (float)VOXTRAL_N_DELAY_TOKENS, VOXTRAL_DEC_DIM);
+    ctx->logits_cpu.resize(VOXTRAL_VOCAB_SIZE);
 
     LOG_INFO(ctx, "context initialized");
     return ctx;
@@ -1839,11 +1841,14 @@ static bool run_encoder_chunk(
 {
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    std::vector<uint8_t> meta_buf(meta_size);
+    static thread_local std::vector<uint8_t> encoder_meta_buf;
+    if (encoder_meta_buf.size() < meta_size) {
+        encoder_meta_buf.resize(meta_size);
+    }
 
     ggml_init_params p = {
         /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ meta_buf.data(),
+        /*.mem_buffer=*/ encoder_meta_buf.data(),
         /*.no_alloc  =*/ true,
     };
     ggml_context * gctx = ggml_init(p);
@@ -2043,11 +2048,14 @@ static bool run_adapter(voxtral_context * ctx) {
 
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, false);
-    std::vector<uint8_t> meta_buf(meta_size);
+    static thread_local std::vector<uint8_t> adapter_meta_buf;
+    if (adapter_meta_buf.size() < meta_size) {
+        adapter_meta_buf.resize(meta_size);
+    }
 
     ggml_init_params p = {
         /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ meta_buf.data(),
+        /*.mem_buffer=*/ adapter_meta_buf.data(),
         /*.no_alloc  =*/ true,
     };
     ggml_context * gctx = ggml_init(p);
@@ -2091,11 +2099,14 @@ static bool run_decoder_prefill(
 
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    std::vector<uint8_t> meta_buf(meta_size);
+    static thread_local std::vector<uint8_t> prefill_meta_buf;
+    if (prefill_meta_buf.size() < meta_size) {
+        prefill_meta_buf.resize(meta_size);
+    }
 
     ggml_init_params p = {
         /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ meta_buf.data(),
+        /*.mem_buffer=*/ prefill_meta_buf.data(),
         /*.no_alloc  =*/ true,
     };
     ggml_context * gctx = ggml_init(p);
@@ -2118,9 +2129,10 @@ static bool run_decoder_prefill(
 
     ggml_tensor * pos_t = find_tensor_in_graph(gf, "positions");
     if (pos_t) {
-        std::vector<int32_t> pos(n_tokens);
-        std::iota(pos.begin(), pos.end(), 0);
-        ggml_backend_tensor_set(pos_t, pos.data(), 0, n_tokens * sizeof(int32_t));
+        static thread_local std::vector<int32_t> pos_buf;
+        pos_buf.resize(n_tokens);
+        std::iota(pos_buf.begin(), pos_buf.end(), 0);
+        ggml_backend_tensor_set(pos_t, pos_buf.data(), 0, n_tokens * sizeof(int32_t));
     }
 
     ggml_tensor * time_t = find_tensor_in_graph(gf, "time_emb");
@@ -2131,13 +2143,14 @@ static bool run_decoder_prefill(
     // Set causal mask: lower-triangular (0 for allowed, -inf for masked)
     ggml_tensor * mask_t = find_tensor_in_graph(gf, "causal_mask");
     if (mask_t) {
-        std::vector<float> mask(n_tokens * n_tokens);
+        static thread_local std::vector<float> mask_buf;
+        mask_buf.resize((size_t) n_tokens * n_tokens);
         for (int32_t i = 0; i < n_tokens; i++) {
             for (int32_t j = 0; j < n_tokens; j++) {
-                mask[i * n_tokens + j] = (j <= i) ? 0.0f : -INFINITY;
+                mask_buf[(size_t) i * n_tokens + j] = (j <= i) ? 0.0f : -INFINITY;
             }
         }
-        ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
+        ggml_backend_tensor_set(mask_t, mask_buf.data(), 0, mask_buf.size() * sizeof(float));
     }
 
     // Compute
@@ -2306,12 +2319,12 @@ static bool voxtral_transcribe_from_audio(
     const int32_t n_audio = ctx.dec_seq_len;
 
     // 6. Build prompt tokens: [BOS] + [STREAMING_PAD] * (N_LEFT_PAD_TOKENS + N_DELAY_TOKENS)
-    std::vector<int32_t> prompt_ids;
-    prompt_ids.push_back(VOXTRAL_TOKEN_BOS);
-    for (int32_t i = 0; i < VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS; i++) {
-        prompt_ids.push_back(VOXTRAL_TOKEN_STREAMING_PAD);
+    constexpr int32_t L = 1 + VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS;  // 39
+    int32_t prompt_ids[L];
+    prompt_ids[0] = VOXTRAL_TOKEN_BOS;
+    for (int32_t i = 1; i < L; ++i) {
+        prompt_ids[i] = VOXTRAL_TOKEN_STREAMING_PAD;
     }
-    const int32_t L = (int32_t)prompt_ids.size();  // 39
 
     LOG_INFO(&ctx, "prompt: %d tokens, audio_tokens: %d", L, n_audio);
 
@@ -2325,9 +2338,9 @@ static bool voxtral_transcribe_from_audio(
 
     // 8. Decoder prefill
     auto t_prefill = std::chrono::steady_clock::now();
-    std::vector<float> logits(VOXTRAL_VOCAB_SIZE);
+    std::vector<float> & logits = ctx.logits_cpu;
     if (L > 1) {
-        if (!run_decoder_prefill(&ctx, prompt_ids.data(), L - 1, logits.data())) {
+        if (!run_decoder_prefill(&ctx, prompt_ids, L - 1, logits.data())) {
             return false;
         }
     }
