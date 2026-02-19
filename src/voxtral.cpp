@@ -2639,12 +2639,19 @@ static bool voxtral_stream_decode_impl(
         return false;
     }
 
+    // Bound generation length by current window duration to reduce decode latency.
+    const float audio_seconds = (float) stream->pcm_buffer.size() / (float) VOXTRAL_SAMPLE_RATE;
+    const int32_t dynamic_cap = std::max<int32_t>(
+        24,
+        (int32_t) std::ceil(audio_seconds * 10.0f) + 8);
+    const int32_t effective_max_tokens = std::min(stream->params.max_tokens, dynamic_cap);
+
     voxtral_result full;
     if (!voxtral_transcribe_from_audio(
         *stream->ctx,
         stream->pcm_buffer.data(),
         (int32_t) stream->pcm_buffer.size(),
-        stream->params.max_tokens,
+        effective_max_tokens,
         full,
         true,
         stream->params.early_stop_pad_tokens)) {
