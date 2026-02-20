@@ -43,6 +43,15 @@ This document tracks the Android-focused fork work that has already been impleme
   - lower default max token budget
   - shorter early-stop tail in streaming mode
 - [x] Added dynamic token cap based on audio-window duration to reduce decode tail latency.
+- [x] Added Android CPU live preset helper API:
+  - `voxtral_stream_params_android_cpu_live()`
+- [x] Added stream runtime tunables:
+  - `silence_rms_threshold`
+  - `decoder_step_cache_capacity`
+  - `low_latency_preset`
+- [x] Added stream stats API:
+  - `voxtral_stream_get_stats(...)`
+  - includes per-call timings and counters (`RTF`, encoder/prefill/decode timing, skip/failure counters)
 
 ### Vulkan robustness and safety
 
@@ -61,10 +70,14 @@ This document tracks the Android-focused fork work that has already been impleme
 - [x] Added silence gate in streaming decode (RMS threshold) to skip costly inference on near-silent chunks.
 - [x] Added CPU fast-path copy (`memcpy`) for encoder chunk accumulation when backend is CPU.
 - [x] Added decoder-step graph cache keyed by `(position, audio_pos, kv_used)` with proper invalidation.
+- [x] Added experimental incremental encoder mode for streaming:
+  - `voxtral_stream_params::experimental_incremental_encoder`
+  - reuses encoder prefix and re-encodes suffix with overlap
+  - auto-invalidates when rolling-window drop occurs
 
 ## Current Known Limits
 
-- True incremental encoder state reuse is **not** implemented yet.
+- Incremental encoder is currently **experimental** and not yet parity-validated across all content/devices.
 - CPU streaming still re-encodes the current rolling window (bounded by `max_buffer_samples`).
 - On slow devices, live transcription can still lag behind real time if model compute exceeds real-time budget.
 
@@ -79,19 +92,18 @@ This document tracks the Android-focused fork work that has already been impleme
 
 ### Priority 1
 
-- [ ] Expose stream silence-gate threshold as API parameter (currently internal constant).
-- [ ] Add optional stats API for stream lag and timing (encoder/prefill/decode per call).
 - [ ] Add optional on-device argmax path to reduce logits readback bandwidth in decode loop.
+- [ ] Add JNI bridge usage docs/examples for adaptive live tuning from `voxtral_stream_get_stats`.
 
 ### Priority 2
 
 - [ ] Improve rolling-window text finalization semantics for very long sessions.
-- [ ] Add optional bounded decoder-step cache size as context param.
 - [ ] Add targeted Android benchmark executable/fixture for regression checks.
+- [ ] Parity tests for experimental incremental encoder vs baseline path.
 
 ### Deferred (Higher Complexity)
 
-- [ ] True incremental encoder update (append-only encoder compute over new audio with cached state).
+- [ ] Full production-grade incremental encoder update (parity-hardened and enabled by default).
 - [ ] Fully streaming mel+encoder pipeline with no re-encode of prior window frames.
 
 ## Validation Checklist
@@ -100,4 +112,3 @@ This document tracks the Android-focused fork work that has already been impleme
 - [ ] Stable CPU operation for long sessions with bounded memory growth.
 - [ ] Live latency does not increase unbounded over time with rolling window enabled.
 - [ ] Final transcript quality acceptable with app-side offline finalization pass.
-
