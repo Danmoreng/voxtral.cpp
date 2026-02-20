@@ -74,6 +74,10 @@ This document tracks the Android-focused fork work that has already been impleme
   - `voxtral_stream_params::experimental_incremental_encoder`
   - reuses encoder prefix and re-encodes suffix with overlap
   - auto-invalidates when rolling-window drop occurs
+- [x] Added experimental persistent stream decode state:
+  - `voxtral_stream_params::experimental_persistent_stream_state`
+  - keeps decoder KV/progression across `voxtral_stream_decode` calls
+  - decodes only newly available adapter positions and auto-resets on rolling-buffer drop/failure
 
 ## Current Known Limits
 

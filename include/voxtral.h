@@ -136,6 +136,7 @@ struct voxtral_stream_params {
     bool    return_first_step_logits = false;                // if true, fill voxtral_result::first_step_logits
     bool    low_latency_preset = false;                      // if true, apply conservative live defaults
     bool    experimental_incremental_encoder = false;        // WIP: reuse encoder prefix and re-encode suffix only
+    bool    experimental_persistent_stream_state = false;    // WIP: keep decoder state across calls and decode only new adapter positions
 };
 
 struct voxtral_stream_stats {
