@@ -93,7 +93,7 @@ This document tracks the Android-focused fork work that has already been impleme
 ### Priority 1
 
 - [ ] Add optional on-device argmax path to reduce logits readback bandwidth in decode loop.
-- [ ] Add default no-logits decode path for streaming/live mode; only read full logits when explicitly requested (e.g. diagnostics/alternatives).
+- [x] Add default no-logits decode path for streaming/live mode; only read full logits when explicitly requested (e.g. diagnostics/alternatives).
 - [ ] Precompute decoder time-conditioning `ada_scale` once per delay setting and reuse it in decoder layers (avoid per-layer/per-step recomputation).
 - [ ] Add JNI bridge usage docs/examples for adaptive live tuning from `voxtral_stream_get_stats`.
 

@@ -2700,6 +2700,7 @@ static bool voxtral_transcribe_from_audio(
     voxtral_result  & result,
     bool              log_audio,
     int32_t           early_stop_pad_tokens = VOXTRAL_N_RIGHT_PAD_TOKENS,
+    bool              return_first_step_logits = true,
     voxtral_stream_stats * stream_stats = nullptr,
     voxtral_incremental_encoder_state * inc_state = nullptr)
 {
@@ -2858,16 +2859,16 @@ static bool voxtral_transcribe_from_audio(
 
     // 8. Decoder prefill
     auto t_prefill = std::chrono::steady_clock::now();
-    std::vector<float> & logits = ctx.logits_cpu;
     if (L > 1) {
-        if (!run_decoder_prefill(&ctx, prompt_ids, L - 1, logits.data(), nullptr)) {
+        if (!run_decoder_prefill(&ctx, prompt_ids, L - 1, nullptr, nullptr)) {
             return false;
         }
     }
 
     // 8b. One step with last prefix token (matches Python prefill + forward_one)
     int32_t token = VOXTRAL_TOKEN_EOS;
-    if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data(), &token)) {
+    float * first_step_logits = return_first_step_logits ? ctx.logits_cpu.data() : nullptr;
+    if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, first_step_logits, &token)) {
         return false;
     }
     const double prefill_ms = elapsed_ms(t_prefill);
@@ -2878,8 +2879,10 @@ static bool voxtral_transcribe_from_audio(
 
     // First token from decoder step argmax.
 
-    // Store first step logits
-    result.first_step_logits = logits;
+    // Store first step logits only when explicitly requested.
+    if (return_first_step_logits) {
+        result.first_step_logits = ctx.logits_cpu;
+    }
     result.tokens.push_back(token);
 
     LOG_INFO(&ctx, "first token: %d", token);
@@ -2945,7 +2948,8 @@ bool voxtral_transcribe_audio(
     voxtral_result    & result)
 {
     return voxtral_transcribe_from_audio(
-        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, true, VOXTRAL_N_RIGHT_PAD_TOKENS);
+        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, true,
+        VOXTRAL_N_RIGHT_PAD_TOKENS, true);
 }
 
 bool voxtral_transcribe_file(
@@ -2963,7 +2967,8 @@ bool voxtral_transcribe_file(
         (float)audio.size() / VOXTRAL_SAMPLE_RATE);
 
     return voxtral_transcribe_from_audio(
-        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, false, VOXTRAL_N_RIGHT_PAD_TOKENS);
+        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, false,
+        VOXTRAL_N_RIGHT_PAD_TOKENS, true);
 }
 
 struct voxtral_stream {
@@ -3129,6 +3134,7 @@ static bool voxtral_stream_decode_impl(
         full,
         true,
         stream->params.early_stop_pad_tokens,
+        stream->params.return_first_step_logits,
         &stream->stats,
         stream->params.experimental_incremental_encoder ? &stream->enc_state : nullptr)) {
         stream->stats.failures++;
