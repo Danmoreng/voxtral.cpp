@@ -179,6 +179,7 @@ struct voxtral_context {
     // Per-chunk encoder output (fixed size, reused each chunk)
     ggml_tensor * encoder_chunk_output = nullptr;  // [enc_dim, MAX_ENC_CHUNK]
     ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
+    ggml_tensor * decoder_argmax  = nullptr;  // [1] int32
     ggml_tensor * decoder_ada_scale = nullptr; // [dec_dim, dec_layers]
     bool decoder_ada_scale_ready = false;
 
@@ -1214,7 +1215,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Allocate persistent tensors: encoder chunk output, decoder logits, KV cache
     {
-        constexpr size_t n_tensors = 5;
+        constexpr size_t n_tensors = 6;
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -1231,6 +1232,10 @@ voxtral_context * voxtral_init_from_model(
         ctx->decoder_logits = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_F32,
             VOXTRAL_VOCAB_SIZE);
         ggml_set_name(ctx->decoder_logits, "decoder_logits");
+
+        // decoder_argmax: [1]
+        ctx->decoder_argmax = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_I32, 1);
+        ggml_set_name(ctx->decoder_argmax, "decoder_argmax");
 
         // decoder_ada_scale: [dec_dim, dec_layers]
         ctx->decoder_ada_scale = ggml_new_tensor_2d(ctx->ctx_persistent, GGML_TYPE_F32,
@@ -2024,8 +2029,9 @@ static ggml_cgraph * build_decoder_prefill_graph(
 
     ggml_tensor * logits = ggml_mul_mat(gctx, model->tok_embeddings_weight, last_hidden); // [vocab_size]
 
-    // Copy logits to persistent
+    // Copy logits and argmax token to persistent outputs.
     ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
+    ggml_build_forward_expand(gf, ggml_cpy(gctx, ggml_argmax(gctx, logits), ctx->decoder_argmax));
 
     return gf;
 }
@@ -2085,8 +2091,9 @@ static ggml_cgraph * build_decoder_step_graph(
     ggml_tensor * x_flat = ggml_reshape_1d(gctx, x, VOXTRAL_DEC_DIM); // [dec_dim]
     ggml_tensor * logits = ggml_mul_mat(gctx, model->tok_embeddings_weight, x_flat); // [vocab_size]
 
-    // Copy to persistent
+    // Copy logits and argmax token to persistent outputs.
     ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
+    ggml_build_forward_expand(gf, ggml_cpy(gctx, ggml_argmax(gctx, logits), ctx->decoder_argmax));
 
     return gf;
 }
@@ -2414,7 +2421,8 @@ static bool run_decoder_prefill(
     voxtral_context * ctx,
     const int32_t   * token_ids,
     int32_t           n_tokens,
-    float           * logits_out)  // [vocab_size]
+    float           * logits_out,  // [vocab_size], optional
+    int32_t         * token_out)   // optional argmax token
 {
     if (ctx->backend_failed) {
         LOG_ERR(ctx, "decoder prefill: backend is in failed state");
@@ -2508,8 +2516,12 @@ static bool run_decoder_prefill(
         return false;
     }
 
-    // Read logits
-    ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    if (logits_out) {
+        ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    }
+    if (token_out) {
+        ggml_backend_tensor_get(ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
+    }
 
     ctx->kv_used = std::min(n_tokens, ctx->kv_window);
 
@@ -2565,7 +2577,8 @@ static bool run_decoder_step(
     int32_t           token_id,
     int32_t           position,     // absolute position in decoder sequence
     int32_t           audio_pos,    // position in adapter output for audio embedding
-    float           * logits_out)   // [vocab_size]
+    float           * logits_out,   // [vocab_size], optional
+    int32_t         * token_out)    // optional argmax token
 {
     if (ctx->backend_failed) {
         LOG_ERR(ctx, "decoder step: backend is in failed state");
@@ -2653,8 +2666,12 @@ static bool run_decoder_step(
         return false;
     }
 
-    // Read logits
-    ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    if (logits_out) {
+        ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    }
+    if (token_out) {
+        ggml_backend_tensor_get(ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
+    }
 
     ctx->kv_used += 1;
 
@@ -2843,13 +2860,14 @@ static bool voxtral_transcribe_from_audio(
     auto t_prefill = std::chrono::steady_clock::now();
     std::vector<float> & logits = ctx.logits_cpu;
     if (L > 1) {
-        if (!run_decoder_prefill(&ctx, prompt_ids, L - 1, logits.data())) {
+        if (!run_decoder_prefill(&ctx, prompt_ids, L - 1, logits.data(), nullptr)) {
             return false;
         }
     }
 
     // 8b. One step with last prefix token (matches Python prefill + forward_one)
-    if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data())) {
+    int32_t token = VOXTRAL_TOKEN_EOS;
+    if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data(), &token)) {
         return false;
     }
     const double prefill_ms = elapsed_ms(t_prefill);
@@ -2858,8 +2876,7 @@ static bool voxtral_transcribe_from_audio(
         stream_stats->last_prefill_ms = prefill_ms;
     }
 
-    // First token from prefill
-    int32_t token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+    // First token from decoder step argmax.
 
     // Store first step logits
     result.first_step_logits = logits;
@@ -2874,12 +2891,9 @@ static bool voxtral_transcribe_from_audio(
     for (int32_t pos = L; pos < n_audio && (int32_t)result.tokens.size() < max_tokens; pos++) {
         if (token == VOXTRAL_TOKEN_EOS) break;
 
-        if (!run_decoder_step(&ctx, token, pos, pos, logits.data())) {
+        if (!run_decoder_step(&ctx, token, pos, pos, nullptr, &token)) {
             return false;
         }
-
-        // Greedy argmax
-        token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 
         result.tokens.push_back(token);
 
