@@ -179,6 +179,8 @@ struct voxtral_context {
     // Per-chunk encoder output (fixed size, reused each chunk)
     ggml_tensor * encoder_chunk_output = nullptr;  // [enc_dim, MAX_ENC_CHUNK]
     ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
+    ggml_tensor * decoder_ada_scale = nullptr; // [dec_dim, dec_layers]
+    bool decoder_ada_scale_ready = false;
 
     // KV cache: [kv_heads*head_dim, dec_window, dec_layers]
     ggml_tensor * kv_self_k       = nullptr;
@@ -398,6 +400,102 @@ static void compute_time_embedding(std::vector<float> & out, float t, int32_t di
         out[i]        = cosf(angle);   // cos first half
         out[i + half] = sinf(angle);   // sin second half
     }
+}
+
+static inline float gelu_erf_scalar(float x) {
+    return 0.5f * x * (1.0f + erff(x * 0.7071067811865475244f));
+}
+
+static bool tensor_to_f32_vector(
+    voxtral_context * ctx,
+    ggml_tensor * t,
+    std::vector<float> & out,
+    size_t elems,
+    const char * tag) {
+    if (!ctx || !t || elems == 0) {
+        return false;
+    }
+
+    const ggml_type type = t->type;
+    out.resize(elems);
+
+    if (type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, elems * sizeof(float));
+        return true;
+    }
+
+    if (type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp(elems);
+        ggml_backend_tensor_get(t, tmp.data(), 0, elems * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(tmp.data(), out.data(), (int64_t) elems);
+        return true;
+    }
+
+    if (type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> tmp(elems);
+        ggml_backend_tensor_get(t, tmp.data(), 0, elems * sizeof(ggml_bf16_t));
+        ggml_bf16_to_fp32_row(tmp.data(), out.data(), (int64_t) elems);
+        return true;
+    }
+
+    LOG_WARN(ctx, "decoder ada precompute: unsupported tensor type for %s: %s",
+        tag ? tag : "<unknown>", ggml_type_name(type));
+    return false;
+}
+
+static bool precompute_decoder_ada_scale(voxtral_context * ctx) {
+    if (!ctx || !ctx->model || !ctx->decoder_ada_scale) {
+        return false;
+    }
+    if ((int32_t) ctx->time_emb_cpu.size() != VOXTRAL_DEC_DIM) {
+        return false;
+    }
+
+    std::vector<float> ada0;
+    std::vector<float> ada2;
+    std::vector<float> ada_scale((size_t) VOXTRAL_DEC_LAYERS * VOXTRAL_DEC_DIM, 0.0f);
+    std::array<float, VOXTRAL_ADA_NORM_DIM> hidden{};
+
+    for (int32_t layer = 0; layer < VOXTRAL_DEC_LAYERS; ++layer) {
+        auto & L = ctx->model->dec_layers[layer];
+        if (!L.ada0_weight || !L.ada2_weight) {
+            LOG_WARN(ctx, "decoder ada precompute: missing ada weights at layer %d", layer);
+            return false;
+        }
+
+        const size_t n_ada0 = (size_t) VOXTRAL_ADA_NORM_DIM * VOXTRAL_DEC_DIM;
+        const size_t n_ada2 = (size_t) VOXTRAL_DEC_DIM * VOXTRAL_ADA_NORM_DIM;
+        if (!tensor_to_f32_vector(ctx, L.ada0_weight, ada0, n_ada0, "ada0.weight") ||
+            !tensor_to_f32_vector(ctx, L.ada2_weight, ada2, n_ada2, "ada2.weight")) {
+            return false;
+        }
+
+        for (int32_t i = 0; i < VOXTRAL_ADA_NORM_DIM; ++i) {
+            const float * row = ada0.data() + (size_t) i * VOXTRAL_DEC_DIM;
+            float sum = 0.0f;
+            for (int32_t j = 0; j < VOXTRAL_DEC_DIM; ++j) {
+                sum += row[j] * ctx->time_emb_cpu[j];
+            }
+            hidden[i] = gelu_erf_scalar(sum);
+        }
+
+        float * layer_scale = ada_scale.data() + (size_t) layer * VOXTRAL_DEC_DIM;
+        for (int32_t i = 0; i < VOXTRAL_DEC_DIM; ++i) {
+            const float * row = ada2.data() + (size_t) i * VOXTRAL_ADA_NORM_DIM;
+            float sum = 0.0f;
+            for (int32_t j = 0; j < VOXTRAL_ADA_NORM_DIM; ++j) {
+                sum += row[j] * hidden[j];
+            }
+            layer_scale[i] = sum;
+        }
+    }
+
+    ggml_backend_tensor_set(
+        ctx->decoder_ada_scale,
+        ada_scale.data(),
+        0,
+        ada_scale.size() * sizeof(float));
+    return true;
 }
 
 static double elapsed_ms(const std::chrono::steady_clock::time_point & t0) {
@@ -1116,7 +1214,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Allocate persistent tensors: encoder chunk output, decoder logits, KV cache
     {
-        constexpr size_t n_tensors = 4;
+        constexpr size_t n_tensors = 5;
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -1133,6 +1231,11 @@ voxtral_context * voxtral_init_from_model(
         ctx->decoder_logits = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_F32,
             VOXTRAL_VOCAB_SIZE);
         ggml_set_name(ctx->decoder_logits, "decoder_logits");
+
+        // decoder_ada_scale: [dec_dim, dec_layers]
+        ctx->decoder_ada_scale = ggml_new_tensor_2d(ctx->ctx_persistent, GGML_TYPE_F32,
+            VOXTRAL_DEC_DIM, VOXTRAL_DEC_LAYERS);
+        ggml_set_name(ctx->decoder_ada_scale, "decoder_ada_scale");
 
         int32_t req_kv_window = params.kv_window_override;
 #ifdef __ANDROID__
@@ -1214,6 +1317,10 @@ voxtral_context * voxtral_init_from_model(
 
     // Time embedding for t = N_DELAY_TOKENS
     compute_time_embedding(ctx->time_emb_cpu, (float)VOXTRAL_N_DELAY_TOKENS, VOXTRAL_DEC_DIM);
+    ctx->decoder_ada_scale_ready = precompute_decoder_ada_scale(ctx);
+    if (!ctx->decoder_ada_scale_ready) {
+        LOG_WARN(ctx, "decoder ada precompute unavailable; using per-layer compute path");
+    }
     ctx->logits_cpu.resize(VOXTRAL_VOCAB_SIZE);
 
     LOG_INFO(ctx, "context initialized");
@@ -1825,15 +1932,22 @@ static ggml_tensor * build_decoder_layer(
     ggml_tensor * h_norm = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS); // [dec_dim, n_tokens]
     h_norm = ggml_mul(gctx, h_norm, L.ffn_norm_weight); // [dec_dim, n_tokens]
 
-    // Ada time conditioning: h_norm = h_norm * (1 + ada_mlp(time_emb))
-    // = h_norm + h_norm * ada_scale
-    // ada_mlp: Linear(3072->32) -> GELU -> Linear(32->3072)
+    // Ada time conditioning: h_norm = h_norm * (1 + ada_scale)
+    // Prefer precomputed per-layer scale. Fallback to in-graph MLP if unavailable.
     {
-        ggml_tensor * ada_hidden = ggml_mul_mat(gctx, L.ada0_weight, time_emb); // [ada_dim]
-        ada_hidden = ggml_gelu_erf(gctx, ada_hidden); // [ada_dim]
-        ggml_tensor * ada_scale = ggml_mul_mat(gctx, L.ada2_weight, ada_hidden); // [dec_dim]
+        ggml_tensor * ada_scale = nullptr;
+        if (ctx->decoder_ada_scale_ready && ctx->decoder_ada_scale) {
+            ada_scale = ggml_view_1d(
+                gctx,
+                ctx->decoder_ada_scale,
+                VOXTRAL_DEC_DIM,
+                (size_t) layer_idx * ctx->decoder_ada_scale->nb[1]); // [dec_dim]
+        } else {
+            ggml_tensor * ada_hidden = ggml_mul_mat(gctx, L.ada0_weight, time_emb); // [ada_dim]
+            ada_hidden = ggml_gelu_erf(gctx, ada_hidden); // [ada_dim]
+            ada_scale = ggml_mul_mat(gctx, L.ada2_weight, ada_hidden); // [dec_dim]
+        }
 
-        // h_norm * (1 + ada_scale) = h_norm + h_norm * ada_scale
         ggml_tensor * scaled = ggml_mul(gctx, h_norm, ada_scale); // [dec_dim, n_tokens]
         h_norm = ggml_add(gctx, h_norm, scaled); // [dec_dim, n_tokens]
     }

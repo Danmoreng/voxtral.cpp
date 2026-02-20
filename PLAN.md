@@ -93,18 +93,24 @@ This document tracks the Android-focused fork work that has already been impleme
 ### Priority 1
 
 - [ ] Add optional on-device argmax path to reduce logits readback bandwidth in decode loop.
+- [ ] Add default no-logits decode path for streaming/live mode; only read full logits when explicitly requested (e.g. diagnostics/alternatives).
+- [ ] Precompute decoder time-conditioning `ada_scale` once per delay setting and reuse it in decoder layers (avoid per-layer/per-step recomputation).
 - [ ] Add JNI bridge usage docs/examples for adaptive live tuning from `voxtral_stream_get_stats`.
 
 ### Priority 2
 
+- [ ] Add streaming EOS policy option: provisional EOS handling (continue with STREAMING_PAD unless strict/final mode).
 - [ ] Improve rolling-window text finalization semantics for very long sessions.
 - [ ] Add targeted Android benchmark executable/fixture for regression checks.
 - [ ] Parity tests for experimental incremental encoder vs baseline path.
+- [ ] Add A/B benchmark coverage for decode-step bandwidth and `ada_scale` precompute wins on Android CPU/GPU backends.
 
 ### Deferred (Higher Complexity)
 
 - [ ] Full production-grade incremental encoder update (parity-hardened and enabled by default).
 - [ ] Fully streaming mel+encoder pipeline with no re-encode of prior window frames.
+- [ ] Port C-style incremental conv-stem state machine (tail/residual/stride alignment) to reduce repeated work in live streaming.
+- [ ] Move from rolling-window re-transcribe to persistent encoder+adapter+decoder streaming state with adapter-buffer compaction.
 
 ## Validation Checklist
 
