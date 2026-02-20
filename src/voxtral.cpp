@@ -3013,6 +3013,7 @@ static void stream_reset_persistent_decode_state(voxtral_stream * stream) {
     stream->eos_seen = false;
     stream->gen_pos = 0;
     stream->prev_token = VOXTRAL_TOKEN_STREAMING_PAD;
+    stream->emitted_text.clear();
     clear_kv_cache(stream->ctx);
 }
 
@@ -3162,7 +3163,6 @@ static bool voxtral_stream_decode_impl(
     const int32_t effective_max_tokens = std::min(stream->params.max_tokens, dynamic_cap);
 
     auto t_total = std::chrono::steady_clock::now();
-    stream->stats.last_audio_samples = (int32_t) stream->pcm_buffer.size();
 
     if (stream->params.experimental_persistent_stream_state) {
         auto * inc_state = stream->params.experimental_incremental_encoder ? &stream->enc_state : nullptr;
@@ -3230,11 +3230,16 @@ static bool voxtral_stream_decode_impl(
         stream->stats.last_prefill_ms = elapsed_ms(t_prefill);
 
         auto t_decode = std::chrono::steady_clock::now();
+        const int32_t initial_gen_pos = stream->gen_pos;
         int32_t generated_this_call = (int32_t) new_tokens.size();
+
+        // When forcing (flush), we ignore max_tokens to catch up fully
+        const int32_t loop_max_tokens = force ? 1024 : effective_max_tokens;
+
         while (stream->decoder_started &&
                !stream->eos_seen &&
                stream->gen_pos < n_audio &&
-               generated_this_call < effective_max_tokens) {
+               generated_this_call < loop_max_tokens) {
             int32_t token = VOXTRAL_TOKEN_EOS;
             if (!run_decoder_step(stream->ctx, stream->prev_token, stream->gen_pos, stream->gen_pos, nullptr, &token)) {
                 stream->stats.failures++;
@@ -3263,6 +3268,10 @@ static bool voxtral_stream_decode_impl(
             generated_this_call > 0 ? stream->stats.last_decode_ms / (double) generated_this_call : 0.0;
         stream->stats.last_generated_tokens = (int32_t) stream->persistent_tokens.size();
 
+        // Calculate audio duration covered in this decode step for better RTF reporting
+        const double audio_processed_s = (double)(stream->gen_pos - initial_gen_pos) * 1280.0 / (double)VOXTRAL_SAMPLE_RATE;
+        stream->stats.last_audio_samples = (int32_t)(audio_processed_s * VOXTRAL_SAMPLE_RATE);
+
         const std::string full_text = decode_tokens(*stream->ctx->model, stream->persistent_tokens);
         out_partial.tokens = stream->persistent_tokens;
         out_partial.text = text_delta(stream->emitted_text, full_text);
@@ -3288,6 +3297,7 @@ static bool voxtral_stream_decode_impl(
         out_partial = full;
         out_partial.text = text_delta(stream->emitted_text, full.text);
         stream->emitted_text = full.text;
+        stream->stats.last_audio_samples = (int32_t) stream->pcm_buffer.size();
     }
 
     stream->stats.decode_success++;
