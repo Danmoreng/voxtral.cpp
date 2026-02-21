@@ -109,7 +109,11 @@ endif()
 add_subdirectory(ggml)
 
 add_library(voxtral_lib
-    src/voxtral.cpp)
+    src/voxtral.cpp
+    src/common/voxtral_context_utils.cpp
+    src/audio/voxtral_audio.cpp
+    src/model/voxtral_model_loader.cpp
+    src/layers/voxtral_layers.cpp)
 
 # On Windows with BUILD_SHARED_LIBS=ON, export symbols automatically so the
 # import library (voxtral_lib.lib) is generated for dependents like `voxtral`.
@@ -119,7 +123,9 @@ endif()
 
 target_include_directories(voxtral_lib
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_link_libraries(voxtral_lib
     PUBLIC
