@@ -1375,8 +1375,16 @@ static void clear_kv_cache(voxtral_context * ctx) {
     if (!ctx || !ctx->kv_self_k || !ctx->kv_self_v) {
         return;
     }
-    ggml_backend_tensor_memset(ctx->kv_self_k, 0, 0, ggml_nbytes(ctx->kv_self_k));
-    ggml_backend_tensor_memset(ctx->kv_self_v, 0, 0, ggml_nbytes(ctx->kv_self_v));
+    
+    // Workaround for OpenCL backend missing memset support: use host-to-device copy
+    size_t k_size = ggml_nbytes(ctx->kv_self_k);
+    std::vector<uint8_t> zeros(k_size, 0);
+    ggml_backend_tensor_set(ctx->kv_self_k, zeros.data(), 0, k_size);
+    
+    size_t v_size = ggml_nbytes(ctx->kv_self_v);
+    if (v_size != k_size) zeros.resize(v_size, 0);
+    ggml_backend_tensor_set(ctx->kv_self_v, zeros.data(), 0, v_size);
+
     ctx->kv_used = 0;
 }
 
@@ -1393,6 +1401,8 @@ static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
     const size_t layer_stride = ctx->kv_self_k->nb[2];
 
     std::vector<uint8_t> tmp((size_t) (window - shift) * row_bytes);
+    std::vector<uint8_t> zeros((size_t) shift * row_bytes, 0); // Pre-allocate zeros for tail
+
     for (int32_t l = 0; l < VOXTRAL_DEC_LAYERS; ++l) {
         const size_t layer_off = (size_t) l * layer_stride;
         const size_t moved_bytes = (size_t) (window - shift) * row_bytes;
@@ -1401,11 +1411,13 @@ static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
 
         ggml_backend_tensor_get(ctx->kv_self_k, tmp.data(), head_off, moved_bytes);
         ggml_backend_tensor_set(ctx->kv_self_k, tmp.data(), layer_off, moved_bytes);
-        ggml_backend_tensor_memset(ctx->kv_self_k, 0, tail_off, (size_t) shift * row_bytes);
+        // Replace memset with set
+        ggml_backend_tensor_set(ctx->kv_self_k, zeros.data(), tail_off, (size_t) shift * row_bytes);
 
         ggml_backend_tensor_get(ctx->kv_self_v, tmp.data(), head_off, moved_bytes);
         ggml_backend_tensor_set(ctx->kv_self_v, tmp.data(), layer_off, moved_bytes);
-        ggml_backend_tensor_memset(ctx->kv_self_v, 0, tail_off, (size_t) shift * row_bytes);
+        // Replace memset with set
+        ggml_backend_tensor_set(ctx->kv_self_v, zeros.data(), tail_off, (size_t) shift * row_bytes);
     }
 }
 
