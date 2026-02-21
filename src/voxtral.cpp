@@ -2343,30 +2343,13 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
                        (const uint8_t *) ctx->encoder_chunk_output->data + src_offset,
                        copy_bytes);
             } else {
-                // OPTIMIZED: Device-to-Device Copy using backend copy (avoids CPU roundtrip)
-                struct ggml_init_params params = {
-                    /*.mem_size   =*/ 2 * sizeof(struct ggml_tensor) + 1024,
-                    /*.mem_buffer =*/ NULL,
-                    /*.no_alloc   =*/ true,
-                };
-                struct ggml_context * ctx_copy = ggml_init(params);
-
-                struct ggml_tensor * src_view = ggml_view_1d(
-                    ctx_copy,
-                    ctx->encoder_chunk_output,
-                    copy_bytes / ggml_type_size(ctx->encoder_chunk_output->type),
-                    src_offset
-                );
-
-                struct ggml_tensor * dst_view = ggml_view_1d(
-                    ctx_copy,
-                    ctx->encoder_output,
-                    copy_bytes / ggml_type_size(ctx->encoder_output->type),
-                    dst_offset
-                );
-
-                ggml_backend_tensor_copy(src_view, dst_view);
-                ggml_free(ctx_copy);
+                // Manual copy via host buffer (fallback for OpenCL without cpy_tensor)
+                static thread_local std::vector<uint8_t> tmp;
+                if (tmp.size() < copy_bytes) {
+                    tmp.resize(copy_bytes);
+                }
+                ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), src_offset, copy_bytes);
+                ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
             }
         }
 
