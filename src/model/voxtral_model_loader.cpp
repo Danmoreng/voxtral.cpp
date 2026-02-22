@@ -14,6 +14,8 @@
 #include "ggml-opencl.h"
 #endif
 
+#include "../../ggml/src/ggml-quants.h"
+
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -128,6 +130,30 @@ static bool tensor_to_f32_vector(
         ggml_bf16_to_fp32_row(tmp.data(), out.data(), (int64_t) elems);
         return true;
     }
+
+    auto dequantize_helper = [&](auto dequant_func, auto block_type_ptr) -> bool {
+        size_t nbytes = ggml_nbytes(t);
+        std::vector<uint8_t> tmp(nbytes);
+        ggml_backend_tensor_get(t, tmp.data(), 0, nbytes);
+        dequant_func((decltype(block_type_ptr)) tmp.data(), out.data(), (int64_t) elems);
+        return true;
+    };
+
+    switch (type) {
+        case GGML_TYPE_Q4_0: return dequantize_helper(dequantize_row_q4_0, (const block_q4_0 *) nullptr);
+        case GGML_TYPE_Q4_1: return dequantize_helper(dequantize_row_q4_1, (const block_q4_1 *) nullptr);
+        case GGML_TYPE_Q5_0: return dequantize_helper(dequantize_row_q5_0, (const block_q5_0 *) nullptr);
+        case GGML_TYPE_Q5_1: return dequantize_helper(dequantize_row_q5_1, (const block_q5_1 *) nullptr);
+        case GGML_TYPE_Q8_0: return dequantize_helper(dequantize_row_q8_0, (const block_q8_0 *) nullptr);
+        case GGML_TYPE_Q2_K: return dequantize_helper(dequantize_row_q2_K, (const block_q2_K *) nullptr);
+        case GGML_TYPE_Q3_K: return dequantize_helper(dequantize_row_q3_K, (const block_q3_K *) nullptr);
+        case GGML_TYPE_Q4_K: return dequantize_helper(dequantize_row_q4_K, (const block_q4_K *) nullptr);
+        case GGML_TYPE_Q5_K: return dequantize_helper(dequantize_row_q5_K, (const block_q5_K *) nullptr);
+        case GGML_TYPE_Q6_K: return dequantize_helper(dequantize_row_q6_K, (const block_q6_K *) nullptr);
+        case GGML_TYPE_Q8_K: return dequantize_helper(dequantize_row_q8_K, (const block_q8_K *) nullptr);
+        default: break;
+    }
+
     LOG_WARN(ctx, "decoder ada precompute: unsupported tensor type for %s: %s", tag, ggml_type_name(type));
     return false;
 }
