@@ -389,8 +389,8 @@ voxtral_stream * voxtral_stream_create(voxtral_context * ctx, const voxtral_stre
     if (s->params.min_decode_samples <= 0) s->params.min_decode_samples = VOXTRAL_SAMPLE_RATE;
     if (s->params.max_buffer_samples <= 0) s->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE*2;
     if (s->params.max_buffer_samples < s->params.min_decode_samples) s->params.max_buffer_samples = s->params.min_decode_samples;
-    if (s->params.early_stop_pad_tokens < 0) s->params.early_stop_pad_tokens = 0;
-    if (s->params.silence_rms_threshold < 0.0f) s->params.silence_rms_threshold = 0.0f;
+    if (s->params.early_stop_pad_tokens <= 0) s->params.early_stop_pad_tokens = 8;
+    if (s->params.silence_rms_threshold < 0.0f) s->params.silence_rms_threshold = 0.0035f;
     if (s->params.decoder_step_cache_capacity > 0) {
         if (s->ctx->dec_step_cache_capacity != s->params.decoder_step_cache_capacity) {
             clear_decoder_step_cache(s->ctx);
@@ -413,7 +413,8 @@ static bool voxtral_stream_decode_impl(voxtral_stream * s, voxtral_result & out,
     s->stats.decode_calls++;
     if (!force && s->pending < s->params.min_decode_samples) { s->stats.skipped_cadence++; return false; }
     if (compute_rms(s->pcm.data() + std::max<int32_t>(0, (int32_t)s->pcm.size() - s->pending), std::min<int32_t>(s->pending, (int32_t)s->pcm.size())) < s->params.silence_rms_threshold) { s->pending = 0; s->stats.skipped_silence++; return false; }
-    const int32_t max_tok = std::min(s->params.max_tokens, (int32_t)std::ceil(s->pcm.size() * 10.0f / VOXTRAL_SAMPLE_RATE) + 8);
+    const int32_t dynamic_cap = std::max<int32_t>(24, (int32_t)std::ceil(s->pcm.size() * 10.0f / VOXTRAL_SAMPLE_RATE) + 8);
+    const int32_t max_tok = std::min(s->params.max_tokens, dynamic_cap);
     auto t0 = std::chrono::steady_clock::now();
     if (s->params.experimental_persistent_stream_state) {
         int32_t n_audio = 0; if (!prepare_decoder_memory_from_audio(*s->ctx, s->pcm.data(), (int32_t)s->pcm.size(), true, &s->stats, &s->enc, n_audio)) { s->stats.failures++; stream_reset_persistent_decode_state(s); return false; }
@@ -425,9 +426,10 @@ static bool voxtral_stream_decode_impl(voxtral_stream * s, voxtral_result & out,
             if (s->params.return_first_step_logits) out.first_step_logits = s->ctx->logits_cpu;
             s->started = true; s->gen_pos = L; s->prev = tok; if (tok != VOXTRAL_TOKEN_EOS) s->tokens.push_back(tok); else if (force) s->eos = true;
         }
-        while (s->started && !s->eos && s->gen_pos < n_audio && (int32_t)s->tokens.size() < (force ? 1024 : max_tok)) {
+        int32_t n_new = 0;
+        while (s->started && !s->eos && s->gen_pos < n_audio && n_new < (force ? 1024 : max_tok)) {
             int32_t tok = VOXTRAL_TOKEN_EOS; if (!run_decoder_step(s->ctx, s->prev, s->gen_pos, s->gen_pos, nullptr, &tok)) break;
-            s->gen_pos++; s->prev = tok;
+            s->gen_pos++; s->prev = tok; n_new++;
             if (tok == VOXTRAL_TOKEN_EOS) { if (force) s->eos = true; break; } else s->tokens.push_back(tok);
         }
         const std::string full = decode_tokens(*s->ctx->model, s->tokens); out.tokens = s->tokens; out.text = text_delta(s->emitted, full); s->emitted = full;
@@ -441,4 +443,4 @@ static bool voxtral_stream_decode_impl(voxtral_stream * s, voxtral_result & out,
 bool voxtral_stream_decode(voxtral_stream * s, voxtral_result & out) { return voxtral_stream_decode_impl(s, out, false); }
 bool voxtral_stream_flush(voxtral_stream * s, voxtral_result & out) { return voxtral_stream_decode_impl(s, out, true); }
 bool voxtral_stream_get_stats(const voxtral_stream * s, voxtral_stream_stats & out) { if (!s) return false; out = s->stats; return true; }
-voxtral_stream_params voxtral_stream_params_android_cpu_live() { voxtral_stream_params p; p.max_tokens = 48; p.min_decode_samples = VOXTRAL_SAMPLE_RATE/2; p.max_buffer_samples = VOXTRAL_SAMPLE_RATE*5; p.early_stop_pad_tokens = 8; return p; }
+voxtral_stream_params voxtral_stream_params_android_cpu_live() { voxtral_stream_params p; p.max_tokens = 48; p.min_decode_samples = VOXTRAL_SAMPLE_RATE/2; p.max_buffer_samples = VOXTRAL_SAMPLE_RATE*5; p.early_stop_pad_tokens = 8; p.silence_rms_threshold = 0.0035f; p.decoder_step_cache_capacity = 96; return p; }
