@@ -22,13 +22,13 @@ static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens pe
 // Logging helper
 // ============================================================================
 
-#define LOG(ctx_ptr, lvl, ...) 
-    do { 
-        if ((ctx_ptr) && (ctx_ptr)->logger && static_cast<int>(lvl) <= static_cast<int>((ctx_ptr)->log_level)) { 
-            char _buf[2048]; 
-            snprintf(_buf, sizeof(_buf), __VA_ARGS__); 
-            (ctx_ptr)->logger(lvl, std::string(_buf)); 
-        } 
+#define LOG(ctx_ptr, lvl, ...) \
+    do { \
+        if ((ctx_ptr) && (ctx_ptr)->logger && static_cast<int>(lvl) <= static_cast<int>((ctx_ptr)->log_level)) { \
+            char _buf[2048]; \
+            snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
+            (ctx_ptr)->logger(lvl, std::string(_buf)); \
+        } \
     } while (0)
 
 #define LOG_INFO(ctx_ptr, ...)  LOG(ctx_ptr, voxtral_log_level::info,  __VA_ARGS__)

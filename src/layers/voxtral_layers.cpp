@@ -1,5 +1,6 @@
 #include "voxtral_layers.h"
-#include "voxtral_common.h"
+#include "../common/voxtral_common.h"
+#include "../../ggml/src/ggml-impl.h"
 #include <cmath>
 
 causal_conv1d_dims compute_causal_conv1d_dims(int32_t in_len, int32_t kernel_size, int32_t stride) {

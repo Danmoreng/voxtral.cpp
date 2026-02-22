@@ -1,5 +1,5 @@
 #include "voxtral_model_internal.h"
-#include "voxtral_common.h"
+#include "../common/voxtral_common.h"
 #include "ggml-cpu.h"
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
@@ -26,8 +26,7 @@
 static ggml_tensor * get_tensor(ggml_context * ctx, const char * name) {
     ggml_tensor * t = ggml_get_tensor(ctx, name);
     if (!t) {
-        fprintf(stderr, "voxtral: tensor '%s' not found in GGUF
-", name);
+        fprintf(stderr, "voxtral: tensor '%s' not found in GGUF\n", name);
     }
     return t;
 }

@@ -1,5 +1,5 @@
 #pragma once
-#include "voxtral_common.h"
+#include "../common/voxtral_common.h"
 #include <vector>
 #include <string>
 

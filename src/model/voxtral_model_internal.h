@@ -1,6 +1,6 @@
 #pragma once
 
-#include "voxtral_types.h"
+#include "../common/voxtral_types.h"
 #include <string>
 #include <vector>
 

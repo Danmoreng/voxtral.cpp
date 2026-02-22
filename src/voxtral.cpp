@@ -358,8 +358,8 @@ static bool voxtral_transcribe_from_audio(voxtral_context & ctx, const float * a
     res.text = decode_tokens(*ctx.model, res.tokens); return true;
 }
 
-bool voxtral_transcribe_audio(voxtral_context & ctx, const std::vector<float> & audio, int32_t max_tok, voxtral_result & res) { return voxtral_transcribe_from_audio(ctx, audio.data(), (int32_t)audio.size(), max_tok, res, true, VOXTRAL_N_RIGHT_PAD_TOKENS, true); }
-bool voxtral_transcribe_file(voxtral_context & ctx, const std::string & path, int32_t max_tok, voxtral_result & res) { std::vector<float> audio; if (!load_wav_file(path, audio)) return false; return voxtral_transcribe_from_audio(ctx, audio.data(), (int32_t)audio.size(), max_tok, res, false, VOXTRAL_N_RIGHT_PAD_TOKENS, true); }
+bool voxtral_transcribe_audio(voxtral_context & ctx, const std::vector<float> & audio, int32_t max_tok, voxtral_result & res) { return voxtral_transcribe_from_audio(ctx, audio.data(), (int32_t)audio.size(), max_tok, res, true, VOXTRAL_N_RIGHT_PAD_TOKENS, true, nullptr, nullptr); }
+bool voxtral_transcribe_file(voxtral_context & ctx, const std::string & path, int32_t max_tok, voxtral_result & res) { std::vector<float> audio; if (!load_wav_file(path, audio)) return false; return voxtral_transcribe_from_audio(ctx, audio.data(), (int32_t)audio.size(), max_tok, res, false, VOXTRAL_N_RIGHT_PAD_TOKENS, true, nullptr, nullptr); }
 
 struct voxtral_stream {
     voxtral_context * ctx = nullptr; voxtral_stream_params params; std::vector<float> pcm; int32_t pending = 0; std::string emitted; std::vector<int32_t> tokens; bool started = false, eos = false; int32_t gen_pos = 0, prev = VOXTRAL_TOKEN_STREAMING_PAD; voxtral_stream_stats stats; voxtral_incremental_encoder_state enc;

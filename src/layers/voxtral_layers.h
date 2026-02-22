@@ -1,6 +1,6 @@
 #pragma once
 
-#include "voxtral_types.h"
+#include "../common/voxtral_types.h"
 
 struct causal_conv1d_dims {
     int32_t pad_left = 0;
