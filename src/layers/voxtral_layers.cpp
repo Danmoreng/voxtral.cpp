@@ -84,8 +84,7 @@ ggml_cgraph * build_encoder_graph(voxtral_context * ctx, ggml_context * gctx, co
 
         q = ggml_rope_ext(gctx, ggml_reshape_3d(gctx, q, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_HEADS, seq_len), pos, nullptr, VOXTRAL_ENC_HEAD_DIM, 0, 0, VOXTRAL_ENC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         k = ggml_rope_ext(gctx, ggml_reshape_3d(gctx, k, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_KV_HEADS, seq_len), pos, nullptr, VOXTRAL_ENC_HEAD_DIM, 0, 0, VOXTRAL_ENC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        q = ggml_permute(gctx, ggml_reshape_2d(gctx, ggml_cont(gctx, q), VOXTRAL_ENC_HEADS * VOXTRAL_ENC_HEAD_DIM, seq_len), 0, 1, 2, 3); // placeholder for permute logic
-        // ... (simplified attention for brevity in file create call, will refine if needed)
+
         // Correct permutation for flash_attn: [head_dim, seq_len, n_heads]
         q = ggml_permute(gctx, ggml_reshape_3d(gctx, q, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_HEADS, seq_len), 0, 2, 1, 3);
         k = ggml_permute(gctx, ggml_reshape_3d(gctx, k, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_KV_HEADS, seq_len), 0, 2, 1, 3);

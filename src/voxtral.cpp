@@ -102,6 +102,10 @@ static bool alloc_decoder_memory(voxtral_context * ctx, int32_t dec_seq) {
     return true;
 }
 
+struct voxtral_incremental_encoder_state {
+    bool valid = false, buffer_dropped = false; int32_t prev_n_frames = 0, prev_enc_tokens = 0; std::vector<float> prev_encoder_tokens;
+};
+
 static bool run_encoder_chunk(voxtral_context * ctx, const float * chunk_mel_data, int32_t chunk_mel_frames, int32_t rope_pos_offset, int32_t * out_seq_len) {
     if (ctx->backend_failed) return false;
     int32_t chunk_seq_len = 0;
@@ -128,11 +132,21 @@ static bool run_encoder_chunk(voxtral_context * ctx, const float * chunk_mel_dat
     return true;
 }
 
-static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, int32_t total_mel_frames) {
+static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, int32_t total_mel_frames, voxtral_incremental_encoder_state * inc) {
     const int32_t mel_stride = VOXTRAL_ENC_CHUNK_MEL - VOXTRAL_ENC_CHUNK_OVERLAP * 2;
     int32_t alloc_total = compute_total_enc_tokens(total_mel_frames);
     if (alloc_total <= 0 || !alloc_encoder_output(ctx, alloc_total)) return false;
     int32_t mel_offset = 0, enc_write_offset = 0, chunk_idx = 0;
+    if (inc && inc->valid && !inc->buffer_dropped) {
+        while (mel_offset + VOXTRAL_ENC_CHUNK_MEL <= inc->prev_n_frames) {
+            int32_t chunk_mel_frames = VOXTRAL_ENC_CHUNK_MEL;
+            int32_t skip = (chunk_idx > 0) ? VOXTRAL_ENC_CHUNK_OVERLAP : 0;
+            int32_t chunk_seq_len = mel_frames_to_enc_tokens(chunk_mel_frames);
+            int32_t stride = std::min(chunk_seq_len - skip, alloc_total - enc_write_offset);
+            if (stride <= 0) break;
+            enc_write_offset += stride; mel_offset += mel_stride; chunk_idx++;
+        }
+    }
     while (mel_offset < total_mel_frames) {
         int32_t chunk_mel_frames = std::min(VOXTRAL_ENC_CHUNK_MEL, total_mel_frames - mel_offset);
         int32_t skip = (chunk_idx > 0) ? VOXTRAL_ENC_CHUNK_OVERLAP : 0;
@@ -151,6 +165,7 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
     }
     ctx->enc_seq_used = (enc_write_offset / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
     ctx->total_enc_tokens = ctx->enc_seq_used;
+    if (inc) { inc->valid = true; inc->buffer_dropped = false; inc->prev_n_frames = total_mel_frames; inc->prev_enc_tokens = enc_write_offset; }
     return true;
 }
 
@@ -318,9 +333,6 @@ void voxtral_free(voxtral_context * ctx) {
     delete ctx;
 }
 
-struct voxtral_incremental_encoder_state {
-    bool valid = false, buffer_dropped = false; int32_t prev_n_frames = 0, prev_enc_tokens = 0; std::vector<float> prev_encoder_tokens;
-};
 
 static bool prepare_decoder_memory_from_audio(voxtral_context & ctx, const float * audio, int32_t n_samples, bool log_audio, voxtral_stream_stats * stats, voxtral_incremental_encoder_state * inc, int32_t & n_audio_out) {
     if (ctx.backend_failed || !audio || n_samples <= 0) return false;
@@ -330,7 +342,7 @@ static bool prepare_decoder_memory_from_audio(voxtral_context & ctx, const float
     compute_mel_spectrogram(padded.data(), (int32_t)padded.size(), ctx.mel_filters_cpu.data(), ctx.hann_window.data(), mel.data(), &n_frames);
     if (n_frames % 2 != 0) { for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; m++) memmove(mel.data() + m * (n_frames - 1), mel.data() + m * n_frames + 1, (n_frames - 1) * sizeof(float)); n_frames -= 1; }
     auto t0 = std::chrono::steady_clock::now();
-    if (!run_encoder_chunked(&ctx, mel.data(), n_frames)) return false;
+    if (!run_encoder_chunked(&ctx, mel.data(), n_frames, inc)) return false;
     if (stats) stats->last_encoder_ms = elapsed_ms(t0);
     t0 = std::chrono::steady_clock::now(); if (!run_adapter(&ctx)) return false; if (stats) stats->last_adapter_ms = elapsed_ms(t0);
     n_audio_out = ctx.dec_seq_len; return true;
@@ -370,10 +382,21 @@ static float compute_rms(const float * x, int32_t n) { double acc = 0.0; for (in
 static std::string text_delta(const std::string & p, const std::string & c) { size_t best = 0; for (size_t k = 1; k <= std::min(p.size(), c.size()); k++) if (p.compare(p.size() - k, k, c, 0, k) == 0) best = k; return c.substr(best); }
 
 voxtral_stream * voxtral_stream_create(voxtral_context * ctx, const voxtral_stream_params & p) {
+    if (!ctx) return nullptr;
     auto s = new voxtral_stream(); s->ctx = ctx; s->params = p;
     if (s->params.low_latency_preset) { s->params.max_tokens = 48; s->params.min_decode_samples = VOXTRAL_SAMPLE_RATE/2; s->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE*2; s->params.early_stop_pad_tokens = 8; }
-    if (s->params.max_tokens <= 0) s->params.max_tokens = 64; if (s->params.min_decode_samples <= 0) s->params.min_decode_samples = VOXTRAL_SAMPLE_RATE; if (s->params.max_buffer_samples <= 0) s->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE*2;
-    if (s->params.decoder_step_cache_capacity > 0 && s->ctx) s->ctx->dec_step_cache_capacity = s->params.decoder_step_cache_capacity;
+    if (s->params.max_tokens <= 0) s->params.max_tokens = 64;
+    if (s->params.min_decode_samples <= 0) s->params.min_decode_samples = VOXTRAL_SAMPLE_RATE;
+    if (s->params.max_buffer_samples <= 0) s->params.max_buffer_samples = VOXTRAL_SAMPLE_RATE*2;
+    if (s->params.max_buffer_samples < s->params.min_decode_samples) s->params.max_buffer_samples = s->params.min_decode_samples;
+    if (s->params.early_stop_pad_tokens < 0) s->params.early_stop_pad_tokens = 0;
+    if (s->params.silence_rms_threshold < 0.0f) s->params.silence_rms_threshold = 0.0f;
+    if (s->params.decoder_step_cache_capacity > 0) {
+        if (s->ctx->dec_step_cache_capacity != s->params.decoder_step_cache_capacity) {
+            clear_decoder_step_cache(s->ctx);
+            s->ctx->dec_step_cache_capacity = s->params.decoder_step_cache_capacity;
+        }
+    }
     stream_reset_persistent_decode_state(s); return s;
 }
 void voxtral_stream_free(voxtral_stream * s) { delete s; }
@@ -385,23 +408,27 @@ bool voxtral_stream_push_pcm(voxtral_stream * s, const float * p, int32_t n) {
 }
 
 static bool voxtral_stream_decode_impl(voxtral_stream * s, voxtral_result & out, bool force) {
-    if (!s || !s->ctx || s->pcm.empty()) return false; s->stats.decode_calls++;
+    if (!s || !s->ctx || s->pcm.empty()) return false;
+    out.tokens.clear(); out.text.clear(); out.first_step_logits.clear();
+    s->stats.decode_calls++;
     if (!force && s->pending < s->params.min_decode_samples) { s->stats.skipped_cadence++; return false; }
     if (compute_rms(s->pcm.data() + std::max<int32_t>(0, (int32_t)s->pcm.size() - s->pending), std::min<int32_t>(s->pending, (int32_t)s->pcm.size())) < s->params.silence_rms_threshold) { s->pending = 0; s->stats.skipped_silence++; return false; }
     const int32_t max_tok = std::min(s->params.max_tokens, (int32_t)std::ceil(s->pcm.size() * 10.0f / VOXTRAL_SAMPLE_RATE) + 8);
     auto t0 = std::chrono::steady_clock::now();
     if (s->params.experimental_persistent_stream_state) {
-        int32_t n_audio = 0; if (!prepare_decoder_memory_from_audio(*s->ctx, s->pcm.data(), (int32_t)s->pcm.size(), true, &s->stats, nullptr, n_audio)) { s->stats.failures++; stream_reset_persistent_decode_state(s); return false; }
+        int32_t n_audio = 0; if (!prepare_decoder_memory_from_audio(*s->ctx, s->pcm.data(), (int32_t)s->pcm.size(), true, &s->stats, &s->enc, n_audio)) { s->stats.failures++; stream_reset_persistent_decode_state(s); return false; }
         constexpr int32_t L = 1 + VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS;
         int32_t prompt[L]; prompt[0] = VOXTRAL_TOKEN_BOS; for (int i = 1; i < L; i++) prompt[i] = VOXTRAL_TOKEN_STREAMING_PAD;
         if (!s->started) {
             if (n_audio < L) return false; clear_kv_cache(s->ctx); if (!run_decoder_prefill(s->ctx, prompt, L - 1, nullptr, nullptr)) return false;
             int32_t tok = VOXTRAL_TOKEN_EOS; if (!run_decoder_step(s->ctx, prompt[L - 1], L - 1, L - 1, s->params.return_first_step_logits ? s->ctx->logits_cpu.data() : nullptr, &tok)) return false;
+            if (s->params.return_first_step_logits) out.first_step_logits = s->ctx->logits_cpu;
             s->started = true; s->gen_pos = L; s->prev = tok; if (tok != VOXTRAL_TOKEN_EOS) s->tokens.push_back(tok); else if (force) s->eos = true;
         }
-        while (s->started && !s->eos && s->gen_pos < n_audio && (int32_t)out.tokens.size() < (force ? 1024 : max_tok)) {
+        while (s->started && !s->eos && s->gen_pos < n_audio && (int32_t)s->tokens.size() < (force ? 1024 : max_tok)) {
             int32_t tok = VOXTRAL_TOKEN_EOS; if (!run_decoder_step(s->ctx, s->prev, s->gen_pos, s->gen_pos, nullptr, &tok)) break;
-            s->gen_pos++; s->prev = tok; if (tok == VOXTRAL_TOKEN_EOS) { if (force) s->eos = true; break; } else s->tokens.push_back(tok);
+            s->gen_pos++; s->prev = tok;
+            if (tok == VOXTRAL_TOKEN_EOS) { if (force) s->eos = true; break; } else s->tokens.push_back(tok);
         }
         const std::string full = decode_tokens(*s->ctx->model, s->tokens); out.tokens = s->tokens; out.text = text_delta(s->emitted, full); s->emitted = full;
     } else {
